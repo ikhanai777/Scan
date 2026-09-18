@@ -28,6 +28,47 @@ class FeedError(RuntimeError):
     """A fetch failed in a way the caller should count, not crash on."""
 
 
+# The venues worth naming when the configured one will not serve the caller.
+ALTERNATIVE_EXCHANGES = ("kraken", "coinbase", "kucoin", "bybit", "okx", "gateio")
+
+
+def explain_exchange_error(exc: Exception, exchange_id: str) -> str:
+    """Turn a ccxt exception into a line that says what to do about it.
+
+    A raw ccxt traceback is the difference between "this is broken" and "this
+    venue does not serve my country" -- and only the second one tells you to
+    change one environment variable.
+    """
+    text = str(exc)
+    name = type(exc).__name__
+    lowered = text.lower()
+
+    if "451" in text or "restricted location" in lowered or "unavailable in your" in lowered:
+        return (
+            f"{exchange_id} refuses requests from this location (HTTP 451). "
+            f"This is geography, not a bug: set CS_EXCHANGE to a venue that serves you "
+            f"-- {', '.join(ALTERNATIVE_EXCHANGES)}."
+        )
+    if "403" in text or "forbidden" in lowered:
+        return (
+            f"{exchange_id} returned 403. Either the venue is blocking this IP, or an "
+            f"outbound proxy or firewall is denying the host. Public market data needs "
+            f"no API key, so this is not a credentials problem."
+        )
+    if "429" in text or "too many requests" in lowered or name == "RateLimitExceeded":
+        return (
+            f"{exchange_id} is rate-limiting this client. Raise CS_REQUEST_SPACING_MS "
+            f"or CS_SCAN_INTERVAL_S, or lower CS_UNIVERSE_SIZE."
+        )
+    if name in {"NetworkError", "RequestTimeout", "ExchangeNotAvailable"} or "timed out" in lowered:
+        return (
+            f"Could not reach {exchange_id} at all ({name}). Check outbound HTTPS from "
+            f"this machine -- a sandbox or corporate proxy that allowlists hosts will "
+            f"block exchange APIs."
+        )
+    return f"{exchange_id} failed with {name}: {text[:200]}"
+
+
 class Feed(Protocol):
     """What the scanner needs from a data source. Fakes in tests implement this."""
 
@@ -119,8 +160,20 @@ class CCXTFeed:
         if self._markets_loaded:
             return
         self._throttle()
-        self._client.load_markets()
+        try:
+            self._client.load_markets()
+        except Exception as exc:
+            self.stats.record(ok=False)
+            raise FeedError(explain_exchange_error(exc, self.settings.exchange_id)) from exc
         self._markets_loaded = True
+
+    def supported_timeframes(self) -> list[str]:
+        return sorted((getattr(self._client, "timeframes", None) or {}).keys())
+
+    @property
+    def rate_limit_ms(self) -> float:
+        """The venue's own minimum gap between requests, per ccxt."""
+        return float(getattr(self._client, "rateLimit", 0) or 0)
 
     # -- Feed -------------------------------------------------------------
 
@@ -136,7 +189,7 @@ class CCXTFeed:
             tickers = self._client.fetch_tickers()
         except Exception as exc:                     # ccxt raises a wide family
             self.stats.record(ok=False)
-            raise FeedError(f"fetch_tickers failed: {exc}") from exc
+            raise FeedError(explain_exchange_error(exc, self.settings.exchange_id)) from exc
         self.stats.record(ok=True)
 
         markets = getattr(self._client, "markets", {}) or {}

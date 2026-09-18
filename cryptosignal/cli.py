@@ -1,5 +1,6 @@
 """Command line entry points.
 
+    cryptosignal doctor             prove the live feed end to end, then exit
     cryptosignal scan --once        one cycle, then exit
     cryptosignal scan               the loop, on the configured cadence
     cryptosignal serve              dashboard + API
@@ -122,11 +123,28 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Every line is a live measurement. Exit 1 if the pipeline cannot run."""
+    from .diagnostics import diagnose
+
+    print(f"\n  cryptosignal doctor -- live check against {settings.exchange_id}\n")
+    report = diagnose(settings)
+    print(report.render())
+    if report.ok:
+        print("\n  Live data confirmed. `cryptosignal scan --once` runs a real cycle.\n")
+        return 0
+    print("\n  Not ready. Fix the failure above, then run doctor again.\n")
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cryptosignal", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    doctor = sub.add_parser("doctor", help="prove the live feed end to end and exit")
+    doctor.set_defaults(func=cmd_doctor)
 
     scan = sub.add_parser("scan", help="run the scan loop")
     scan.add_argument("--once", action="store_true", help="a single cycle, then exit")

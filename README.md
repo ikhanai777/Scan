@@ -12,6 +12,9 @@ $ cryptosignal scan --once
   15:02:41  INFO  cryptosignal.scanner  FIRED SHORT AVAX/USDT @ 64% (composite -73.1)
 ```
 
+*Illustrative output — the shape of a cycle, not a recorded one. Run
+`cryptosignal doctor` to see real numbers from a real venue.*
+
 **Not financial advice.** v1 generates and delivers signals. It does not place
 orders and it does not size anything against an account balance. Short-horizon
 crypto signals carry a high false-positive rate, which is why the app tracks
@@ -34,6 +37,7 @@ and publishes its own hit rate and drawdown rather than implying certainty.
 ```bash
 pip install -e ".[api]"
 
+cryptosignal doctor            # prove the live feed end to end, first
 cryptosignal screen            # what the funnel sees right now; fires nothing
 cryptosignal scan --once       # one full cycle
 cryptosignal serve --scan      # dashboard on :8000, scan loop beside it
@@ -42,6 +46,53 @@ cryptosignal stats             # the track record so far
 
 No credentials are needed to scan: the exchange market data this uses is
 public. Telegram alerts need a bot token (see `.env.example`).
+
+### Start with `doctor`
+
+"It runs" and "it is reading a live market" are different claims, and only the
+second one matters for a signal app. `doctor` walks the whole pipeline once
+against the configured venue and prints what it actually measured — market
+counts, a real price and spread, the age of the newest candle, the indicator
+readings off that candle, and the score they produce:
+
+```
+  [ok]   exchange       binance answered in 240ms
+  [ok]   markets        2,183 live spot markets, 512 against USDT
+  [ok]   timeframe      15m candles supported
+  [ok]   live price     BTC/USDT 63,204.5  912M 24h volume, 0.16bps spread
+  [ok]   stage 1        20 of 512 markets clear the floor (>25M volume, <8bps spread)
+  [ok]   candles        BTC/USDT: 300 bars, newest opened 4.2 min ago
+  [ok]   indicators     ATR 0.41% of price, RSI 54, ADX 21, rel volume 0.87x
+  [ok]   scoring        BTC/USDT: setup 31, technical +18, composite +18 -> no signal
+  [ok]   rate budget    21 calls per cycle, ~11s at 500ms spacing, cycle every 120s
+  [warn] alerts         no alert channel configured
+  [ok]   database       cryptosignal.db: 0 open, 0 closed signals
+```
+
+*(Shape of the output, not a recorded run — the numbers you get are whatever
+the venue says when you run it.)*
+
+It exits non-zero if the pipeline cannot run, and every failure names the
+change that fixes it rather than printing a ccxt traceback. **The first failure
+most people hit is geographic**: Binance answers HTTP 451 from several
+jurisdictions, and `doctor` says so and lists venues that will serve you
+(`CS_EXCHANGE=kraken`, `coinbase`, `kucoin`, `bybit`, `okx`, `gateio`) instead
+of leaving you to decode the error. A different venue may also need
+`CS_QUOTE=USD` and a lower `CS_MIN_VOLUME_24H`, and `doctor` catches both.
+
+### What has and has not run against a live venue
+
+The scoring path, the funnel, the tracker and the API are covered by 197 tests
+driving them against deterministic synthetic price series — that is what makes
+"an uptrend scores long" an assertion rather than an anecdote. No synthetic
+data ever reaches the database or a signal card; it exists only inside the
+tests.
+
+The ccxt adapter is covered the same way, through a stub client: ticker
+normalisation, the missing-`quoteVolume` fallback, absent bid/ask, per-symbol
+failures, caching and throttling. **It has not been exercised against a real
+exchange** — the machine this was built on has no outbound route to one.
+`doctor` is how you close that gap, in one command, on a machine that does.
 
 ## The two-stage funnel
 
@@ -223,7 +274,7 @@ suite can drive it against synthetic charts with a known shape.
 
 ```bash
 pip install -e ".[api,dev]"
-pytest                    # 174 tests
+pytest                    # 197 tests
 ruff check .
 ```
 
@@ -244,6 +295,10 @@ ruff check .
 - The thresholds and weights are reasoned defaults, **not backtested ones**.
   That is phase 4, and until then the published hit rate is the only evidence
   the tuning works.
+- **No part of this has met a live order book yet.** `cryptosignal doctor`
+  is the first thing to run, and the first real cycle is the first real
+  evidence. Treat everything before that as untested against the one thing
+  that matters.
 - Distributing "trading signals" may need local financial-services
   registration depending on where you are. That is a one-time check worth
   doing before any launch beyond personal use.
