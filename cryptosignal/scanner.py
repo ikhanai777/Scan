@@ -19,10 +19,12 @@ from datetime import datetime
 
 from .alerts import NotifierGroup
 from .config import Settings
+from .context import MarketContext
 from .exchange import Feed, FeedError, candles_are_stale
+from .execution import ExecutionEngine
 from .features import TechnicalFeatures, compute_features
 from .fusion import fuse
-from .legs import score_technical
+from .legs import score_fundamental, score_sentiment, score_technical
 from .levels import build_levels
 from .models import (
     Candidate,
@@ -41,11 +43,19 @@ log = logging.getLogger(__name__)
 
 class Scanner:
     def __init__(self, settings: Settings, feed: Feed, store: Store,
-                 notifiers: NotifierGroup | None = None) -> None:
+                 notifiers: NotifierGroup | None = None,
+                 context: MarketContext | None = None,
+                 execution: ExecutionEngine | None = None) -> None:
         self.settings = settings
         self.feed = feed
         self.store = store
         self.notifiers = notifiers or NotifierGroup([])
+        # Phase 5. None unless CS_EXECUTION_MODE opted in; the scanner works
+        # identically either way, because deciding is separate from trading.
+        self.execution = execution
+        # The non-price providers behind the fundamental and sentiment legs.
+        # Without one the scanner runs technical-only, exactly as phase 1 did.
+        self.context = context
         # Kept from the last cycle so the coin detail view can show the chart
         # readings behind a score without refetching.
         self.last_features: dict[str, TechnicalFeatures] = {}
@@ -68,6 +78,23 @@ class Scanner:
         prices = {m.symbol: m.last for m in markets}
         for update in update_open_signals(self.store, prices, now=started_at):
             self.notifiers.signal_resolved(update)
+            if self.execution is not None:
+                # An exit that fails engages the kill switch inside the engine;
+                # it must not also take down the cycle that still has open
+                # signals to grade.
+                try:
+                    self.execution.on_resolution(update)
+                except Exception:
+                    log.exception("execution could not close %s", update.signal.symbol)
+
+        # 1b. Refresh the market-wide providers once, not once per candidate.
+        if self.context is not None:
+            try:
+                self.context.refresh()
+            except Exception:
+                # A secondary provider must never take down a cycle: the
+                # technical leg alone still produces a usable signal.
+                log.exception("market context refresh failed; continuing without it")
 
         # 2. Stage 1 -- cheap filter over every market.
         open_symbols = self.store.open_symbols()
@@ -138,7 +165,7 @@ class Scanner:
             if features is None:
                 continue
             legs: list[LegScore] = [score_technical(features, self.settings)]
-            # Phases 2 and 3 append their legs here; fusion renormalises.
+            legs.extend(self._extra_legs(candidate, features))
             fusion = fuse(legs, self.settings)
             if fusion.fired:
                 pending.append((fusion.confidence, candidate, features, fusion))
@@ -156,8 +183,38 @@ class Scanner:
             log.info("FIRED %s %s @ %.0f%% (composite %+.1f)",
                      signal.direction.value.upper(), signal.symbol,
                      signal.confidence, signal.composite_score)
+            if self.execution is not None:
+                try:
+                    self.execution.on_signal(signal, self.settings.paper_equity)
+                except Exception:
+                    # The signal is already recorded and alerted. A broker
+                    # problem must not unwind that.
+                    log.exception("execution failed on %s", signal.symbol)
             fired += 1
         return fired
+
+    def _extra_legs(self, candidate: Candidate, features: TechnicalFeatures) -> list[LegScore]:
+        """The fundamental and sentiment legs, when their providers are wired.
+
+        A provider that throws here would otherwise cost the whole cycle, so
+        the failure is logged and the leg simply does not report -- which
+        fusion already knows how to handle.
+        """
+        if self.context is None:
+            return []
+        try:
+            coin = self.context.for_coin(candidate.symbol, candidate.market.base)
+        except Exception:
+            log.exception("context lookup failed for %s", candidate.symbol)
+            return []
+
+        legs: list[LegScore] = []
+        if self.settings.enable_fundamental_leg:
+            legs.append(score_fundamental(coin.derivatives, coin.book, coin.tvl,
+                                          features, self.settings))
+        if self.settings.enable_sentiment_leg:
+            legs.append(score_sentiment(coin.news, self.context.regime, self.settings))
+        return legs
 
     def _build_signal(self, candidate: Candidate, features: TechnicalFeatures, fusion) -> Signal | None:
         try:

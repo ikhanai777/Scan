@@ -11,3 +11,6 @@ venv/
 *.db-shm
 .pytest_cache/
 .ruff_cache/
+
+# Recorded market data is real but machine- and time-specific; record your own.
+fixtures/

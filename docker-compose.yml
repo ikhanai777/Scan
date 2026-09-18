@@ -1,0 +1,38 @@
+# One command to a live dashboard on localhost:
+#
+#     cp .env.example .env
+#     docker compose up --build
+#     open http://localhost:8000
+#
+# The scanner runs beside the API in one container. SQLite lives on a named
+# volume, so the track record survives a rebuild -- without it, every redeploy
+# silently resets the hit rate the whole app exists to publish.
+
+services:
+  cryptosignal:
+    build: .
+    container_name: cryptosignal
+    restart: unless-stopped
+    ports:
+      - "${CS_API_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      # Inside the container the API must listen on all interfaces for the
+      # port mapping to reach it; .env's 127.0.0.1 default is for running
+      # without Docker.
+      CS_API_HOST: 0.0.0.0
+      CS_API_PORT: 8000
+      CS_DB_PATH: /data/cryptosignal.db
+    volumes:
+      - cryptosignal-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 60s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  cryptosignal-data:

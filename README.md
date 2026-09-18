@@ -4,137 +4,119 @@ A market scanner that screens the crypto universe on a fixed cadence, ranks
 live setups, and issues a long or short call with an entry zone, a stop, two
 targets and a holding window.
 
-```
-$ cryptosignal scan --once
+All five phases of the spec are built: three-leg scoring, outcome tracking, a
+backtest harness that replays real history, and opt-in execution.
 
-  15:02:41  INFO  cryptosignal.scanner  cycle: 412 markets -> 20 universe -> 10 shortlist -> 2 signals in 6.4s
-  15:02:41  INFO  cryptosignal.scanner  FIRED LONG SOL/USDT @ 71% (composite +79.4)
-  15:02:41  INFO  cryptosignal.scanner  FIRED SHORT AVAX/USDT @ 64% (composite -73.1)
-```
+**Not financial advice.** Short-horizon crypto signals carry a high
+false-positive rate, which is why this app measures and publishes its own hit
+rate and drawdown rather than implying certainty. Execution is off by default,
+and turning it on takes two independent switches.
 
-*Illustrative output — the shape of a cycle, not a recorded one. Run
-`cryptosignal doctor` to see real numbers from a real venue.*
+---
 
-**Not financial advice.** v1 generates and delivers signals. It does not place
-orders and it does not size anything against an account balance. Short-horizon
-crypto signals carry a high false-positive rate, which is why the app tracks
-and publishes its own hit rate and drawdown rather than implying certainty.
-
-## What it does
-
-1. **Scans** every spot market on one exchange, on a cadence you set.
-2. **Screens** in two stages — a cheap liquidity filter, then a ranking by how
-   *live* each setup is — so deep analysis only runs on a shortlist.
-3. **Scores** each finalist on a -100 (strong short) to +100 (strong long)
-   scale, one score per analysis leg.
-4. **Fuses** the legs into a composite, and fires above +60 or below -60.
-5. **Delivers** the card to a live dashboard and to Telegram or a webhook.
-6. **Grades** every signal it ever fired, so the win rate is measured, not
-   claimed.
-
-## Quick start
+## Run it on localhost
 
 ```bash
-pip install -e ".[api]"
-
-cryptosignal doctor            # prove the live feed end to end, first
-cryptosignal screen            # what the funnel sees right now; fires nothing
-cryptosignal scan --once       # one full cycle
-cryptosignal serve --scan      # dashboard on :8000, scan loop beside it
-cryptosignal stats             # the track record so far
+git clone https://github.com/ikhanai777/Scan.git && cd Scan
+make install          # venv + deps + .env from the template
+make doctor           # prove every live source, end to end
+make serve            # dashboard on http://localhost:8000
 ```
 
-No credentials are needed to scan: the exchange market data this uses is
-public. Telegram alerts need a bot token (see `.env.example`).
+Or with Docker:
+
+```bash
+cp .env.example .env
+docker compose up --build        # http://localhost:8000
+```
+
+`make help` lists every target. **No API keys are needed.** Price, funding rate,
+open interest and the order book come from the exchange; TVL, the Fear & Greed
+index and the news feeds are public and keyless. Keys only buy extra sources.
 
 ### Start with `doctor`
 
 "It runs" and "it is reading a live market" are different claims, and only the
-second one matters for a signal app. `doctor` walks the whole pipeline once
-against the configured venue and prints what it actually measured — market
-counts, a real price and spread, the age of the newest candle, the indicator
-readings off that candle, and the score they produce:
+second one matters. `doctor` walks the whole pipeline against the configured
+venue and every data provider, and prints what it actually measured:
 
 ```
   [ok]   exchange       binance answered in 240ms
   [ok]   markets        2,183 live spot markets, 512 against USDT
   [ok]   timeframe      15m candles supported
   [ok]   live price     BTC/USDT 63,204.5  912M 24h volume, 0.16bps spread
-  [ok]   stage 1        20 of 512 markets clear the floor (>25M volume, <8bps spread)
+  [ok]   stage 1        20 of 512 markets clear the floor
   [ok]   candles        BTC/USDT: 300 bars, newest opened 4.2 min ago
   [ok]   indicators     ATR 0.41% of price, RSI 54, ADX 21, rel volume 0.87x
   [ok]   scoring        BTC/USDT: setup 31, technical +18, composite +18 -> no signal
-  [ok]   rate budget    21 calls per cycle, ~11s at 500ms spacing, cycle every 120s
-  [warn] alerts         no alert channel configured
+  [ok]   funding / OI   BTC/USDT: funding +0.0100%, open interest 78,412
+  [ok]   order book     BTC/USDT: +12% imbalance on 41.2M resting near mid
+  [ok]   DefiLlama      Aave $11,204M TVL
+  [ok]   Fear & Greed   61 (Greed)
+  [ok]   news feeds     87 headline(s) from 4/4 feed(s) in the last 48h
+  [ok]   rate budget    21 calls per cycle, ~11s at 500ms spacing
+  [ok]   execution      disabled -- signals only, no orders (the default)
   [ok]   database       cryptosignal.db: 0 open, 0 closed signals
 ```
 
-*(Shape of the output, not a recorded run — the numbers you get are whatever
-the venue says when you run it.)*
+*(Shape of the output, not a recorded run — the numbers are whatever your venue
+says when you run it.)*
 
-It exits non-zero if the pipeline cannot run, and every failure names the
-change that fixes it rather than printing a ccxt traceback. **The first failure
-most people hit is geographic**: Binance answers HTTP 451 from several
-jurisdictions, and `doctor` says so and lists venues that will serve you
-(`CS_EXCHANGE=kraken`, `coinbase`, `kucoin`, `bybit`, `okx`, `gateio`) instead
-of leaving you to decode the error. A different venue may also need
-`CS_QUOTE=USD` and a lower `CS_MIN_VOLUME_24H`, and `doctor` catches both.
+It exits non-zero when the pipeline cannot run, and every failure names the
+change that fixes it. **The first failure most people hit is geographic:**
+Binance answers HTTP 451 from several jurisdictions. `doctor` says so and lists
+venues that will serve you (`CS_EXCHANGE=kraken`, `coinbase`, `kucoin`,
+`bybit`, `okx`, `gateio`). A different venue may also need `CS_QUOTE=USD` and a
+lower `CS_MIN_VOLUME_24H`; `doctor` catches both.
 
-### What has and has not run against a live venue
+A secondary provider that stays silent is a **warning, never a failure** — a
+dead news feed costs the sentiment leg some evidence, it does not stop the app.
 
-The scoring path, the funnel, the tracker and the API are covered by 197 tests
-driving them against deterministic synthetic price series — that is what makes
-"an uptrend scores long" an assertion rather than an anecdote. No synthetic
-data ever reaches the database or a signal card; it exists only inside the
-tests.
-
-The ccxt adapter is covered the same way, through a stub client: ticker
-normalisation, the missing-`quoteVolume` fallback, absent bid/ask, per-symbol
-failures, caching and throttling. **It has not been exercised against a real
-exchange** — the machine this was built on has no outbound route to one.
-`doctor` is how you close that gap, in one command, on a machine that does.
+---
 
 ## The two-stage funnel
 
-A cycle cannot afford a full indicator pass over 400 markets, and it does not
-need one. Most markets are doing nothing at any given moment.
+A cycle cannot afford a full indicator pass over 400 markets, and does not need
+one. Most markets are doing nothing at any moment.
 
-**Stage 1 — universe filter.** 24h quote volume above a floor, bid/ask spread
-below a ceiling, no stablecoins or wrapped tokens, and nothing that already
-has an open signal. Cheap, runs on the ticker sweep every market shares.
+**Stage 1 — universe filter.** 24h quote volume above a floor, spread below a
+ceiling, no stablecoins or wrapped tokens, nothing that already has an open
+signal. Runs on the ticker sweep every market shares.
 
-**Stage 2 — opportunity filter.** One indicator pass per survivor, scored on
-how live the setup is, independent of direction:
+**Stage 2 — opportunity filter.** One indicator pass per survivor, scored on how
+*live* the setup is, independent of direction:
 
 | Component | What it measures |
 |---|---|
 | Volatility expansion | ATR against the median of its own last 50 bars |
 | Volume anomaly | This bar's volume against its trailing average |
 | Price action | A fresh break of a pivot level, or coiling against one |
-| Catalyst | *(phase 3 — the news/sentiment trigger)* |
 
-The top N advance. The score is deliberately direction-agnostic: "something is
-happening here" is a different question from "which way", and mixing them would
-let a grinding downtrend crowd out a coiling breakout.
+The top N advance. The score is direction-agnostic on purpose: "something is
+happening here" is a different question from "which way", and mixing them lets
+a grinding downtrend crowd out a coiling breakout.
 
-## Scoring
+---
 
-Three legs, each reporting -100..+100, weighted per the spec:
+## Scoring: three legs
 
-| Leg | Weight | Status |
-|---|---|---|
-| Technical | 50% | **shipped** |
-| Fundamental / on-chain | 25% | phase 2 |
-| News / sentiment | 25% | phase 3 |
+| Leg | Weight | Sources | Key needed |
+|---|---|---|---|
+| Technical | 50% | exchange OHLCV | no |
+| Fundamental / on-chain | 25% | funding, open interest, order book, DefiLlama | no |
+| News / sentiment | 25% | RSS (+ CryptoPanic), Fear & Greed | no (yes for CryptoPanic) |
 
-**Only legs that actually reported get a vote, and the weights are
-renormalised over those.** That is what lets phase 1 run technical-only at full
-strength without pretending the other two legs said "neutral" — a leg with no
-data is *silent*, not neutral, and the two are very different things. Adding
-the on-chain leg later is a new module and one line in the scanner, not a
-reweighting.
+**Only legs that actually reported get a vote, and the weights are renormalised
+over those.** A leg with no data is *silent*, not neutral, and the two are very
+different things — a neutral vote drags a strong reading toward the middle, an
+abstention does not. The same rule runs one level down: a component whose
+inputs never warmed up abstains rather than voting zero.
 
-The technical leg breaks down as:
+This is what makes a missing API key cost accuracy instead of correctness, and
+it is visible on every card: each shows `TECH`, `FUND`, `SENT` chips, greyed
+with a dash where a leg had nothing.
+
+### Technical (50%)
 
 | Component | Weight | Inputs |
 |---|---|---|
@@ -144,161 +126,294 @@ The technical leg breaks down as:
 | Volume | 15% | OBV slope for direction, relative volume for conviction |
 | Structure | 20% | Distance from rolling VWAP, fresh break of a pivot level |
 
-Two details worth knowing:
+**Oscillators decay past the extremes.** An RSI of 95 is a worse entry than 75.
+Without the decay both clip to full marks and the card rates the worst entry in
+the move exactly as highly as the best one.
 
-- **Oscillators decay past the extremes.** An RSI of 95 is a worse entry than
-  an RSI of 75. Without the decay both clip to full marks and the card rates
-  the worst entry in the move exactly as highly as the best one.
-- **A component with no data abstains rather than voting zero.** A neutral
-  vote drags a strong reading toward the middle; an abstention does not.
+### Fundamental / on-chain (25%)
+
+| Component | Weight | Source |
+|---|---|---|
+| Funding rate | 30% | the venue's perpetual, via ccxt |
+| Open interest | 20% | the venue's perpetual, via ccxt |
+| Book pressure | 25% | the venue's order book |
+| TVL trend | 25% | DefiLlama public API |
+
+**Funding is read contrarian at the extremes.** Heavy positive funding means the
+crowd is levered long and paying to stay there — crowded, and the side that gets
+liquidated first. So it scores *bearish*. That sign surprises people, and it is
+the whole point of the component.
+
+**Open interest has no direction on its own.** Rising OI with rising price is
+new longs; rising OI with falling price is new shorts; falling OI is unwinding,
+which reads against the move at half strength.
+
+**What is deliberately missing:** the spec also lists exchange netflow and whale
+wallet activity. Every source for those is paid and keyed, and there is no free
+equivalent. Rather than approximate them with something that is not them, those
+components are absent and the leg renormalises over the four that reported.
+Order-book depth imbalance is included as its own measurement, not as a stand-in
+for netflow.
+
+### News / sentiment (25%)
+
+| Component | Weight | Source |
+|---|---|---|
+| News impact | 50% | public RSS, plus CryptoPanic when keyed |
+| Mention velocity | 25% | the same headlines, against the coin's own baseline |
+| Market regime | 25% | Fear & Greed index (alternative.me) |
+
+Headlines are classified against an event lexicon and weighted by a **recency
+decay** — impact halves every `CS_NEWS_HALF_LIFE_H` hours. A coin no headline
+mentions produces no reading at all.
+
+Two details that keep keyword matching honest:
+
+- **A bare ticker matches case-sensitively.** "ONE", "GAS", "SUN" and "NEAR" are
+  real tickers and also ordinary English; a case-insensitive match turns "One
+  more reason gas fees will fall" into coverage of three coins.
+- **A headline the lexicon cannot call scores zero.** "Coinbase lists token days
+  after exploit drained the treasury" nets to a mildly *bullish* +5 if you just
+  subtract. Admitting the classifier cannot read it is better.
 
 ### Fusion and the card
 
-A weighted sum produces the composite. Above +60 is a long, below -60 a short,
-anything between fires nothing. When the legs disagree — bullish technicals,
-bearish on-chain flow — **the signal still fires, flagged "reduced confidence"
-rather than suppressed.** Suppressing disagreement hides exactly the cases most
-worth looking at. In phase 1 every card carries the flag, because one leg is
-thinner evidence than the three-leg design assumes, and the card says so.
+Above +60 is a long, below −60 a short, between fires nothing. When legs
+disagree — bullish technicals, bearish on-chain flow — **the signal still fires,
+flagged "reduced confidence" rather than suppressed.** Suppressing disagreement
+hides exactly the cases most worth looking at.
 
-Each card carries direction, confidence %, entry zone, stop, two targets, the
-suggested holding window, and the top three factors that drove the score —
-ranked by how much each actually moved its leg, not by raw score.
+Each card carries direction, confidence, entry zone, stop, two targets, the
+holding window, the per-leg scores, and the top three factors that drove it —
+ranked by how much each actually moved its leg.
 
 ### Levels
 
-Everything is derived from ATR and the nearest pivot, so the numbers scale with
-each coin's own volatility instead of assuming a fixed percentage:
+Everything derives from ATR and the nearest pivot, so the numbers scale with
+each coin's own volatility:
 
-- **Entry zone** reaches back against the trade by 0.25 ATR — a pullback entry
-  — and only 0.1 ATR beyond current price, so chasing is bounded.
-- **Stop** is 1.5 ATR, widened to clear a nearby pivot, then hard-capped at
-  2.5 ATR so a distant support cannot quietly turn a scalp into an open-ended
-  bet.
-- **Targets** sit at 1.5R and 2.5R.
+- **Entry zone** reaches back against the trade by 0.25 ATR and only 0.1 ATR
+  beyond current price, so chasing is bounded.
+- **Stop** is 1.5 ATR, widened to clear a nearby pivot, hard-capped at 2.5 ATR.
+- **Targets** at 1.5R and 2.5R.
 - **Holding window** is kinematic: how long the far target takes at the coin's
   recent pace, clamped to the spec's 15-minute-to-72-hour band.
+
+---
 
 ## Outcome tracking
 
 Every signal is written down the moment it fires, with the levels it fired at,
-and only its outcome columns are ever updated — grading a call against levels
-you edited afterwards is grading nothing. The accounting is deliberately
+and only its outcome columns are ever updated. The accounting is deliberately
 pessimistic:
 
 - **The stop is checked before the target.** With one price per cycle we cannot
   know which came first inside the bar, and assuming the good one is how a
   backtest flatters itself.
-- **An expiry is marked to market**, not to the best price the signal ever saw.
+- **An expiry is marked to market**, never to the best price the signal saw.
   Peak R is recorded separately, as information, never as a result.
 
 `cryptosignal stats` and `/api/performance` report closed count, hit rate,
 expectancy in R, total R, max drawdown, average hold, and a long/short split.
 
-## The kill-switch
+---
 
-New signals stop when the feed is degraded: too many OHLCV fetch failures in a
-cycle, or too many charts that arrived but have stopped updating. A chart that
-has frozen is just as degraded as one that failed to arrive — counting only
-hard failures would let a venue that has halted a market keep producing signals
-off an hour-old chart.
+## Backtesting (phase 4)
 
-**The kill-switch never stops the tracker.** Halting new calls but continuing
-to grade open ones is the whole point; halting both would leave open positions
-ungraded, which is worse than firing nothing.
+```bash
+cryptosignal backtest --top 5 --bars 2000      # real history from your venue
+cryptosignal sweep --min-trades 30             # tune against it
+```
+
+Both run on OHLCV paged from the exchange. There is no simulated price series:
+if the venue will not serve the history, the backtest does not run.
+
+**Three rules keep it from flattering itself:**
+
+1. **No lookahead.** A signal at bar *t* uses bars `0..t` only and is entered at
+   bar `t+1`'s **open** — the first price actually tradeable after the decision.
+2. **The stop is checked before the target, inside every bar**, against the real
+   high and low.
+3. **An expiry is marked to the close** of the bar where the window ran out.
+
+`sweep` ranks configurations by expectancy but sorts anything below
+`--min-trades` beneath everything that clears it. Four trades and a perfect
+record is not evidence, and ranking it first is how a sweep talks you into
+overfitting.
+
+**What it can and cannot tune.** It replays the technical leg, the screen and
+the level logic, so it can tune their weights, the threshold band, the stop
+distance and the target multiples. It cannot tune the *leg* weights — that needs
+historical funding, order books and headlines aligned to each bar, and none are
+available free at bar resolution. The leg split stays at the spec's 50/25/25.
+
+---
+
+## Execution (phase 5)
+
+Off by default. `CS_EXECUTION_MODE` takes `disabled`, `paper` or `live`.
+
+**Paper** records orders against real prices and sends nothing anywhere. It does
+not model slippage, queue position or partial fills — a paper fill is the *best
+case*, and the gap between it and a live fill is the cost of finding out for
+real.
+
+**Live places real orders with real money**, and needs two independent switches:
+
+```bash
+CS_EXECUTION_MODE=live
+CS_LIVE_CONFIRM=I understand this places real orders
+```
+
+One environment variable is too easy to set by accident in a deploy config. A
+live configuration missing the phrase or the API keys **refuses to start** — it
+never falls back to paper silently, because paper-trading someone who believes
+they are live is its own kind of failure.
+
+Every order passes one gate, which denies by default:
+
+| Limit | Default |
+|---|---|
+| Risk per trade | 0.5% of equity, sized from the distance to the stop |
+| Max per order | 250 |
+| Max open positions | 3 |
+| Max orders per day | 10 |
+| Daily loss limit | 100, and it **latches** for the rest of the UTC day |
+| Min confidence | 70% |
+| Reduced-confidence signals | refused unless opted in |
+
+Entries are **post-only limit orders** inside the entry zone — a market order on
+a thin book is how a scalp becomes a donation. Exits are market orders, because
+getting out is worth the spread. **An exit that fails engages the kill switch**,
+which is one-way within a process: a human restarts to clear it.
+
+---
 
 ## Dashboard and alerts
 
-`cryptosignal serve --scan` puts the dashboard on `:8000`: a live-scrolling
-feed of signal cards with a countdown to each holding window's end, filters by
-status, direction and confidence, the current watchlist with its setup scores,
-and the track record. It updates over server-sent events, so a new signal
-appears the moment it fires rather than on a refresh.
+`make serve` puts the dashboard on `:8000`: a live-scrolling feed of signal
+cards with per-leg scores and a countdown to each holding window, filters by
+status, direction and confidence, the watchlist with setup scores, the track
+record, live data-source health, and the execution panel with its limits. It
+updates over server-sent events.
 
 | Endpoint | |
 |---|---|
 | `GET /` | the dashboard |
 | `GET /health` | liveness, last cycle, halt state |
-| `GET /api/signals` | the feed, filterable by `status`, `direction`, `symbol`, `min_confidence` |
+| `GET /api/signals` | the feed, filterable |
 | `GET /api/signals/{id}` | one card plus its event history |
 | `GET /api/candidates` | the current shortlist and why each coin is on it |
 | `GET /api/performance` | the track record |
+| `GET /api/sources` | which providers answered on the last cycle |
+| `GET /api/execution` | order state and the risk limits |
 | `GET /api/status` | last cycle plus the resolved tuning |
 | `GET /api/features/{symbol}` | the indicator readings behind a score |
 | `GET /api/stream` | server-sent events |
 
-Telegram is the fastest channel and ships first; a generic JSON webhook takes
-the same card as structured data. A channel that is not configured is simply
-absent, and **a channel that throws is logged and skipped** — a Telegram outage
-must never stop a scan cycle or lose a signal. The database is the record;
-alerts are a copy.
+Telegram ships first; a JSON webhook takes the same card as structured data. A
+channel that throws is logged and skipped — an outage must never stop a cycle or
+lose a signal. The database is the record; alerts are a copy.
 
-## Configuration
+---
 
-Every tunable is an environment variable with a working default — see
-`.env.example` for the full list and `cryptosignal config` for what resolved.
-Nothing in the scoring path is a literal buried in the code, because a weight
-you cannot find is a weight you cannot backtest. The weights are validated at
-startup: leg weights, technical component weights and setup weights each have
-to sum to 1.0, or the process refuses to start.
+## The kill-switch
 
-## Deploying
+New signals stop when the feed is degraded: too many OHLCV fetch failures in a
+cycle, or too many charts that arrived but stopped updating. A frozen chart is
+as degraded as one that failed to arrive.
+
+**It never stops the tracker.** Halting new calls while continuing to grade open
+ones is the point; halting both would leave open positions ungraded.
+
+---
+
+## Testing, and what is real
 
 ```bash
-docker build -t cryptosignal .
-docker run -p 8000:8000 -v cryptosignal-data:/data --env-file .env cryptosignal
+make dev && make test        # 337 tests, 14 skipped until you record fixtures
+make lint
 ```
 
-The `Procfile` covers Railway and Render. SQLite needs a writable path that
-survives a redeploy — mount a volume at `/data`, or the track record resets
-every deploy.
+Being precise about this, because it matters:
+
+**Nothing synthetic reaches a database, a signal card, the dashboard, the
+backtest or an order.** Every number those produce comes from a live provider.
+
+**The test suite uses two kinds of stand-in, both deliberate:**
+
+- *Deterministic price series*, so "an uptrend scores long" is an assertion
+  rather than an anecdote. No live market gives you a path whose right answer is
+  known in advance.
+- *Stub transports* (a fake ccxt client, a mock HTTP layer), so failure paths —
+  a null `quoteVolume`, a 451, a dead feed, a thin book — can be exercised on
+  demand. You cannot ask a real venue to return a malformed ticker.
+
+**For real data in the loop:**
+
+```bash
+cryptosignal record --top 5 --bars 600
+make test          # the 14 skipped tests now run against real market history
+```
+
+Those tests assert **invariants**, not outcomes — nobody knows what BTC *should*
+have scored last Tuesday, so asserting an outcome would be inventing one. They
+check that scores stay in range, no NaN escapes, levels stay ordered, and the
+engine survives shapes a synthetic series never produces: gaps, halted bars,
+repeated closes, volume spikes.
+
+**What has not happened here:** the machine this was built on has no outbound
+route to any exchange — thirteen were tried, all blocked by its egress policy —
+so no part of this has met a live order book. `doctor` is how you close that gap
+in one command.
+
+---
 
 ## Architecture
 
 ```
-exchange.py   ingestion    ccxt -> MarketSnapshot / Candles, cached and throttled
-features.py   one pass     every indicator reading both stages need
-screen.py     stage 1+2    the funnel
-legs/         analysis     one module per leg, each -100..+100 with reasons
-fusion.py     the call     renormalised weighted sum -> direction + confidence
-levels.py     the numbers  entry / stop / targets / window, all ATR-relative
-tracker.py    grading      stop, target or expiry -> a realised R
-store.py      persistence  SQLite: signals, events, cycles
-scanner.py    the cycle    order of operations, capacity, kill-switch
-alerts/       delivery     Telegram, webhook
-api/          delivery     FastAPI + the single-file dashboard
+exchange.py      ingestion    ccxt -> snapshots / candles / history, cached and throttled
+sources/         ingestion    funding, open interest, order book, TVL, news, Fear & Greed
+features.py      one pass     every indicator reading both screen stages need
+screen.py        stage 1+2    the funnel
+legs/            analysis     technical, fundamental, sentiment -- each -100..+100 with reasons
+context.py       analysis     the shared providers, fetched once per cycle
+fusion.py        the call     renormalised weighted sum -> direction + confidence
+levels.py        the numbers  entry / stop / targets / window, all ATR-relative
+tracker.py       grading      stop, target or expiry -> a realised R
+backtest.py      phase 4      replay over real history, and the parameter sweep
+execution/       phase 5      risk gate, paper and live brokers
+store.py         persistence  SQLite: signals, events, cycles
+scanner.py       the cycle    order of operations, capacity, kill-switch
+alerts/          delivery     Telegram, webhook
+api/             delivery     FastAPI + the single-file dashboard
 ```
 
-The scoring path never touches a network or a database, which is why the test
-suite can drive it against synthetic charts with a known shape.
+The scoring path touches no network and no database. That is what makes it
+testable, and it is why the legs take readings as arguments rather than fetching
+their own.
 
-```bash
-pip install -e ".[api,dev]"
-pytest                    # 197 tests
-ruff check .
-```
+---
 
-## Status against the phased plan
+## Configuration
 
-| Phase | Scope | |
-|---|---|---|
-| 1 — MVP | one exchange, technical-only scoring, top-20 universe, signal feed, Telegram alerts | **done** |
-| 2 | on-chain leg (netflow, funding, OI), wider universe, outcome tracking | outcome tracking **done**; the leg is the next module |
-| 3 | news/sentiment leg, three-leg fusion | fusion is already leg-agnostic |
-| 4 | backtesting harness to tune the weights | every weight is already external and named |
-| 5 | exchange auto-execution, opt-in | out of scope for v1 by design |
+Every tunable is an environment variable with a working default — see
+`.env.example`, and `cryptosignal config` for what resolved. Nothing in the
+scoring path is a literal buried in the code, because a weight you cannot find
+is a weight you cannot backtest. Leg weights, each leg's component weights and
+the setup weights must each sum to 1.0 or the process refuses to start.
+
+---
 
 ## Before you point this at anything real
 
-- The default universe is 20 coins on one venue. The spec's 200-300 needs a
-  rate budget this has not been measured against.
-- The thresholds and weights are reasoned defaults, **not backtested ones**.
-  That is phase 4, and until then the published hit rate is the only evidence
-  the tuning works.
-- **No part of this has met a live order book yet.** `cryptosignal doctor`
-  is the first thing to run, and the first real cycle is the first real
-  evidence. Treat everything before that as untested against the one thing
-  that matters.
-- Distributing "trading signals" may need local financial-services
-  registration depending on where you are. That is a one-time check worth
-  doing before any launch beyond personal use.
+- **No part of this has met a live order book yet.** `doctor` first, then a real
+  cycle. That is the first real evidence.
+- **The weights and the lexicon are reasoned, not fitted.** `sweep` against your
+  own venue's history is what turns them into something evidenced — and a
+  configuration that only wins on one window is fitted noise.
+- **Paper before live**, for long enough that the track record means something.
+  The published hit rate is the only evidence the tuning works.
+- Distributing "trading signals" may need local financial-services registration
+  depending on where you are. Worth a one-time check before any launch beyond
+  personal use.

@@ -110,6 +110,26 @@ class Settings:
     tech_w_volume: float = field(default_factory=lambda: _env_float("CS_TECH_W_VOLUME", 0.15))
     tech_w_structure: float = field(default_factory=lambda: _env_float("CS_TECH_W_STRUCTURE", 0.20))
 
+    # ---- fundamental leg component weights ------------------------------
+    # Exchange netflow and whale-wallet activity have no free, keyless source,
+    # so they are absent rather than approximated; these four carry the leg.
+    fund_w_funding: float = field(default_factory=lambda: _env_float("CS_FUND_W_FUNDING", 0.30))
+    fund_w_open_interest: float = field(default_factory=lambda: _env_float("CS_FUND_W_OI", 0.20))
+    fund_w_book: float = field(default_factory=lambda: _env_float("CS_FUND_W_BOOK", 0.25))
+    fund_w_tvl: float = field(default_factory=lambda: _env_float("CS_FUND_W_TVL", 0.25))
+
+    # ---- sentiment leg component weights --------------------------------
+    sent_w_news: float = field(default_factory=lambda: _env_float("CS_SENT_W_NEWS", 0.50))
+    sent_w_velocity: float = field(default_factory=lambda: _env_float("CS_SENT_W_VELOCITY", 0.25))
+    sent_w_regime: float = field(default_factory=lambda: _env_float("CS_SENT_W_REGIME", 0.25))
+    # A headline's impact halves every this many hours. The spec's
+    # "recency-decayed impact score".
+    news_half_life_hours: float = field(default_factory=lambda: _env_float("CS_NEWS_HALF_LIFE_H", 8.0))
+    news_window_hours: float = field(default_factory=lambda: _env_float("CS_NEWS_WINDOW_H", 48.0))
+    cryptopanic_token: str = field(default_factory=lambda: _env_str("CS_CRYPTOPANIC_TOKEN", ""))
+    enable_fundamental_leg: bool = field(default_factory=lambda: _env_bool("CS_ENABLE_FUNDAMENTAL", True))
+    enable_sentiment_leg: bool = field(default_factory=lambda: _env_bool("CS_ENABLE_SENTIMENT", True))
+
     # ---- signal thresholds ----------------------------------------------
     long_threshold: float = field(default_factory=lambda: _env_float("CS_LONG_THRESHOLD", 60.0))
     short_threshold: float = field(default_factory=lambda: _env_float("CS_SHORT_THRESHOLD", -60.0))
@@ -141,6 +161,24 @@ class Settings:
     # means the exchange stopped publishing; that coin is skipped.
     max_candle_age_multiple: float = field(default_factory=lambda: _env_float("CS_MAX_CANDLE_AGE_MULT", 3.0))
 
+    # ---- execution (phase 5) ---------------------------------------------
+    # disabled | paper | live. Default deny: nothing trades unless asked.
+    # `live` additionally requires live_confirm to carry the exact phrase in
+    # execution/risk.py, because one environment variable set by accident in a
+    # deploy config should never be enough to start spending real money.
+    execution_mode: str = field(default_factory=lambda: _env_str("CS_EXECUTION_MODE", "disabled"))
+    live_confirm: str = field(default_factory=lambda: _env_str("CS_LIVE_CONFIRM", ""))
+    exchange_api_key: str = field(default_factory=lambda: _env_str("CS_EXCHANGE_API_KEY", ""))
+    exchange_api_secret: str = field(default_factory=lambda: _env_str("CS_EXCHANGE_API_SECRET", ""))
+    paper_equity: float = field(default_factory=lambda: _env_float("CS_PAPER_EQUITY", 10_000.0))
+    risk_per_trade_pct: float = field(default_factory=lambda: _env_float("CS_RISK_PER_TRADE_PCT", 0.5))
+    max_order_notional: float = field(default_factory=lambda: _env_float("CS_MAX_ORDER_NOTIONAL", 250.0))
+    max_open_positions: int = field(default_factory=lambda: _env_int("CS_MAX_OPEN_POSITIONS", 3))
+    max_orders_per_day: int = field(default_factory=lambda: _env_int("CS_MAX_ORDERS_PER_DAY", 10))
+    max_daily_loss: float = field(default_factory=lambda: _env_float("CS_MAX_DAILY_LOSS", 100.0))
+    min_execution_confidence: float = field(default_factory=lambda: _env_float("CS_MIN_EXEC_CONFIDENCE", 70.0))
+    execute_reduced_confidence: bool = field(default_factory=lambda: _env_bool("CS_EXECUTE_REDUCED_CONFIDENCE", False))
+
     # ---- delivery --------------------------------------------------------
     database_path: str = field(default_factory=lambda: _env_str("CS_DB_PATH", "cryptosignal.db"))
     telegram_bot_token: str = field(default_factory=lambda: _env_str("CS_TELEGRAM_BOT_TOKEN", ""))
@@ -168,6 +206,20 @@ class Settings:
         if abs(tech_total - 1.0) > 1e-6:
             raise ValueError(f"technical component weights must sum to 1.0, got {tech_total:.4f}")
 
+        fund_total = (
+            self.fund_w_funding + self.fund_w_open_interest
+            + self.fund_w_book + self.fund_w_tvl
+        )
+        if abs(fund_total - 1.0) > 1e-6:
+            raise ValueError(f"fundamental component weights must sum to 1.0, got {fund_total:.4f}")
+
+        sent_total = self.sent_w_news + self.sent_w_velocity + self.sent_w_regime
+        if abs(sent_total - 1.0) > 1e-6:
+            raise ValueError(f"sentiment component weights must sum to 1.0, got {sent_total:.4f}")
+
+        if self.news_half_life_hours <= 0:
+            raise ValueError("news_half_life_hours must be positive")
+
         setup_total = (
             self.setup_w_volatility + self.setup_w_volume
             + self.setup_w_price_action + self.setup_w_catalyst
@@ -189,6 +241,16 @@ class Settings:
             raise ValueError("target1_r must be below target2_r")
         if self.stop_atr_multiple <= 0:
             raise ValueError("stop_atr_multiple must be positive")
+
+        if self.execution_mode.strip().lower() not in ("disabled", "paper", "live"):
+            raise ValueError(
+                f"execution_mode must be disabled, paper or live, got {self.execution_mode!r}"
+            )
+        if not 0 < self.risk_per_trade_pct <= 5:
+            # Above 5% of equity per trade, a normal losing streak is ruin.
+            raise ValueError("risk_per_trade_pct must be in (0, 5]")
+        if self.max_open_positions < 1:
+            raise ValueError("max_open_positions must be at least 1")
 
     def as_dict(self) -> dict[str, object]:
         """Public view of the tuning, for the dashboard's config panel."""

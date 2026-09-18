@@ -123,6 +123,46 @@ def create_app(settings: Settings | None = None, store: Store | None = None,
             raise HTTPException(status_code=404, detail="symbol not in the last scan cycle")
         return {"symbol": symbol, "features": _feature_dict(found)}
 
+    @app.get("/api/execution")
+    def execution() -> dict:
+        """Order state and the risk limits, or an explicit 'off'.
+
+        Always answers rather than 404ing when execution is disabled: a panel
+        that cannot tell "off" from "broken" is worse than useless on the one
+        screen where that distinction matters most.
+        """
+        if scanner is None:
+            # Not the same as disabled: the scanner is running in another
+            # process, so this one has nothing to report either way.
+            return {"enabled": False, "attached": False,
+                    "reason": "no scanner in this process -- start with `serve --scan`"}
+        engine = scanner.execution
+        if engine is None:
+            return {"enabled": False, "attached": True,
+                    "reason": f"execution is off (CS_EXECUTION_MODE={settings.execution_mode})"}
+        return {"attached": True, **engine.snapshot()}
+
+    @app.get("/api/sources")
+    def sources() -> dict:
+        """Which data providers actually answered on the last cycle."""
+        legs = {
+            "fundamental": settings.enable_fundamental_leg,
+            "sentiment": settings.enable_sentiment_leg,
+        }
+        if scanner is None:
+            return {"attached": False, "reporting": {}, "feeds": {}, "regime": None, "legs": legs}
+        context = scanner.context
+        if context is None:
+            return {"attached": True, "reporting": {}, "feeds": {}, "regime": None, "legs": legs}
+        return {
+            "attached": True,
+            "reporting": context.sources_reporting,
+            "feeds": getattr(context.news, "feed_health", {}) if context.news else {},
+            "regime": ({"value": context.regime.value, "label": context.regime.label}
+                       if context.regime else None),
+            "legs": legs,
+        }
+
     @app.get("/api/stream")
     async def stream() -> StreamingResponse:
         return StreamingResponse(_events(store, settings), media_type="text/event-stream",

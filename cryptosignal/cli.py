@@ -1,6 +1,6 @@
 """Command line entry points.
 
-    cryptosignal doctor             prove the live feed end to end, then exit
+    cryptosignal doctor             prove every live source end to end, then exit
     cryptosignal scan --once        one cycle, then exit
     cryptosignal scan               the loop, on the configured cadence
     cryptosignal serve              dashboard + API
@@ -8,6 +8,9 @@
     cryptosignal screen             what the screen sees right now, fires nothing
     cryptosignal stats              the published track record
     cryptosignal config             the resolved tuning
+    cryptosignal backtest           replay the engine over real history
+    cryptosignal sweep              tune parameters against real history
+    cryptosignal record             capture real market data as test fixtures
 """
 
 from __future__ import annotations
@@ -19,7 +22,9 @@ import sys
 
 from .alerts import build_notifiers
 from .config import settings
+from .context import MarketContext
 from .exchange import CCXTFeed
+from .execution import build_engine
 from .scanner import Scanner
 from .screen import setup_score, shortlist, stage1_universe
 from .store import Store
@@ -35,12 +40,29 @@ def _configure_logging(verbose: bool) -> None:
 
 
 def _build_scanner() -> tuple[Scanner, Store]:
+    log = logging.getLogger(__name__)
     store = Store(settings.database_path)
     feed = CCXTFeed(settings)
     notifiers = build_notifiers(settings)
     if notifiers.names:
-        logging.getLogger(__name__).info("alert channels: %s", ", ".join(notifiers.names))
-    return Scanner(settings, feed, store, notifiers), store
+        log.info("alert channels: %s", ", ".join(notifiers.names))
+
+    context = MarketContext(settings, exchange_client=feed._client)
+    # build_engine raises on a half-configured live setup rather than starting
+    # in a state the operator did not intend.
+    execution = build_engine(settings, exchange_client=feed._client)
+    if execution is not None:
+        log.warning("execution is ON in %s mode", execution.risk.mode)
+
+    return Scanner(settings, feed, store, notifiers, context=context, execution=execution), store
+
+
+def _resolve_symbols(feed: CCXTFeed, raw: str | None, limit: int) -> list[str]:
+    """An explicit list, or the top of the live universe by liquidity."""
+    if raw:
+        return [s.strip().upper() for s in raw.split(",") if s.strip()]
+    universe = stage1_universe(feed.snapshots(), settings)
+    return [m.symbol for m in universe[:limit]]
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -123,6 +145,96 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backtest(args: argparse.Namespace) -> int:
+    """Replay the engine over real exchange history."""
+    from .backtest import backtest_many
+
+    feed = CCXTFeed(settings)
+    symbols = _resolve_symbols(feed, args.symbols, args.top)
+    print(f"\n  pulling {args.bars} bars of {settings.timeframe} history for "
+          f"{len(symbols)} symbol(s) from {settings.exchange_id}...\n")
+
+    histories = []
+    for symbol in symbols:
+        candles = feed.history(symbol, args.bars)
+        if candles is None or len(candles) < 100:
+            print(f"  [skip] {symbol}: {0 if candles is None else len(candles)} bars returned")
+            continue
+        print(f"  [ok]   {symbol}: {len(candles)} real bars")
+        histories.append(candles)
+
+    if not histories:
+        print("\n  No history came back. Run `cryptosignal doctor` first.\n")
+        return 1
+
+    summary = backtest_many(histories, settings).to_dict()
+    print()
+    print(json.dumps(summary, indent=2))
+    if summary["trades"] == 0:
+        print("\n  No signal fired over this window. That is a result, not a failure:\n"
+              "  widen the window, lower the threshold band, or add symbols.\n")
+    return 0
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    """Tune parameters against real history."""
+    from .backtest import sweep
+
+    grid = {
+        "long_threshold": [55.0, 60.0, 65.0, 70.0],
+        "short_threshold": [-55.0, -60.0, -65.0, -70.0],
+        "stop_atr_multiple": [1.25, 1.5, 2.0],
+    }
+    if args.grid:
+        try:
+            grid = json.loads(args.grid)
+        except ValueError as exc:
+            print(f"--grid must be JSON: {exc}")
+            return 1
+
+    feed = CCXTFeed(settings)
+    symbols = _resolve_symbols(feed, args.symbols, args.top)
+    histories = [c for c in (feed.history(s, args.bars) for s in symbols) if c is not None]
+    if not histories:
+        print("No history came back. Run `cryptosignal doctor` first.")
+        return 1
+
+    print(f"\n  sweeping {len(grid)} parameter(s) over {len(histories)} symbol(s)...\n")
+    rows = sweep(histories, settings, grid, min_trades=args.min_trades)
+
+    print(f"  {'expectancy':>11}{'trades':>8}{'hit rate':>10}{'max DD':>9}   parameters")
+    print("  " + "-" * 82)
+    for row in rows[: args.show]:
+        summary = row.summary
+        flag = " " if row.trades >= args.min_trades else "*"
+        print(f"{flag} {row.expectancy:>10.3f}R{summary['trades']:>8}"
+              f"{(summary['hit_rate'] or 0):>9.0f}%{summary['max_drawdown_r']:>8.1f}R   "
+              f"{row.overrides}")
+    print(f"\n  * fewer than {args.min_trades} trades -- not enough to tune on.")
+    print("  These results fit this window. A parameter set that only wins here\n"
+          "  is fitted noise; re-run over a different period before trusting it.\n")
+    return 0
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    """Capture real market data as test fixtures."""
+    from .fixtures import FIXTURE_DIR, record
+
+    feed = CCXTFeed(settings)
+    symbols = _resolve_symbols(feed, args.symbols, args.top)
+    print(f"\n  recording {args.bars} bars for {len(symbols)} symbol(s)...\n")
+
+    written = record(feed, symbols, args.bars, settings.exchange_id)
+    for path in written:
+        print(f"  [ok] {path}")
+    if not written:
+        print("  Nothing recorded. Run `cryptosignal doctor` first.")
+        return 1
+    print(f"\n  {len(written)} fixture(s) in {FIXTURE_DIR}.\n"
+          f"  `pytest` now runs the engine over this real data too.\n")
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Every line is a live measurement. Exit 1 if the pipeline cannot run."""
     from .diagnostics import diagnose
@@ -165,6 +277,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     config = sub.add_parser("config", help="print the resolved configuration")
     config.set_defaults(func=cmd_config)
+
+    def add_history_args(sub_parser, default_bars: int):
+        sub_parser.add_argument("--symbols", default=None,
+                                help="comma-separated, e.g. BTC/USDT,ETH/USDT (default: the live universe)")
+        sub_parser.add_argument("--top", type=int, default=5, help="how many of the universe to use")
+        sub_parser.add_argument("--bars", type=int, default=default_bars, help="bars of real history")
+
+    backtest = sub.add_parser("backtest", help="replay the engine over real exchange history")
+    add_history_args(backtest, 1500)
+    backtest.set_defaults(func=cmd_backtest)
+
+    sweep_parser = sub.add_parser("sweep", help="tune parameters against real history")
+    add_history_args(sweep_parser, 1500)
+    sweep_parser.add_argument("--grid", default=None, help='JSON, e.g. {"long_threshold":[55,65]}')
+    sweep_parser.add_argument("--min-trades", type=int, default=20,
+                              help="below this a result is not evidence")
+    sweep_parser.add_argument("--show", type=int, default=15, help="rows to print")
+    sweep_parser.set_defaults(func=cmd_sweep)
+
+    record_parser = sub.add_parser("record", help="capture real market data as test fixtures")
+    add_history_args(record_parser, 600)
+    record_parser.set_defaults(func=cmd_record)
     return parser
 
 

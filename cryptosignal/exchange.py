@@ -259,6 +259,58 @@ class CCXTFeed:
         self._cache.put(key, candles, self.settings.ohlcv_cache_seconds)
         return candles
 
+    def history(self, symbol: str, bars: int, page_size: int = 1000) -> Candles | None:
+        """Page back through real OHLCV until `bars` candles are in hand.
+
+        Venues cap a single OHLCV response (usually 500-1500 bars), so any
+        backtest longer than that cap needs paging. This walks forward from a
+        computed start time, which is the direction every venue supports, and
+        stops early when the venue stops returning new bars -- a listing that
+        is younger than the requested window yields whatever it actually has,
+        and is never padded to reach the number asked for.
+        """
+        self._ensure_markets()
+        minutes = timeframe_minutes(self.settings.timeframe)
+        span_ms = bars * minutes * 60_000
+        since = int(time.time() * 1000) - span_ms
+
+        collected: list[list[float]] = []
+        seen_last: int | None = None
+        while len(collected) < bars:
+            self._throttle()
+            try:
+                rows = self._client.fetch_ohlcv(
+                    symbol, timeframe=self.settings.timeframe, since=since, limit=page_size
+                )
+            except Exception as exc:
+                self.stats.record(ok=False)
+                log.warning("history fetch failed for %s: %s", symbol, exc)
+                break
+            self.stats.record(ok=True)
+
+            if not rows:
+                break
+            collected.extend(rows)
+            newest = int(rows[-1][0])
+            # A venue that keeps returning the same final bar has no more to
+            # give; without this check the loop spins forever on a young pair.
+            if seen_last is not None and newest <= seen_last:
+                break
+            seen_last = newest
+            since = newest + minutes * 60_000
+
+        if not collected:
+            return None
+        candles = Candles.from_rows(symbol, self.settings.timeframe, collected)
+        if len(candles) > bars:
+            candles = Candles(
+                symbol=candles.symbol, timeframe=candles.timeframe,
+                timestamps=candles.timestamps[-bars:], open=candles.open[-bars:],
+                high=candles.high[-bars:], low=candles.low[-bars:],
+                close=candles.close[-bars:], volume=candles.volume[-bars:],
+            )
+        return candles
+
     def prices(self, symbols: list[str]) -> dict[str, float]:
         """Last price for the given symbols, reusing the cached ticker sweep."""
         if not symbols:

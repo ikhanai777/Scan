@@ -1,0 +1,8 @@
+
+# fixtures are real recorded market data; keep them out of the image
+fixtures/
+.venv/
+.git/
+__pycache__/
+*.db*
+.env

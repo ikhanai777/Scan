@@ -194,6 +194,12 @@ def diagnose(settings: Settings, feed: CCXTFeed | None = None) -> Report:
                "Signals will still be scored, stored and shown on the dashboard. "
                "Set CS_TELEGRAM_BOT_TOKEN and CS_TELEGRAM_CHAT_ID to get pushed.")
 
+    # -- 11. the phase 2 and 3 providers, each reached for real ------------
+    _check_sources(report, settings, feed, probe.symbol, probe.base)
+
+    # -- 12. execution, which is off unless explicitly asked for -----------
+    _check_execution(report, settings)
+
     store = Store(settings.database_path)
     try:
         performance = store.performance()
@@ -204,3 +210,120 @@ def diagnose(settings: Settings, feed: CCXTFeed | None = None) -> Report:
         store.close()
 
     return report
+
+
+def _check_sources(report: Report, settings: Settings, feed: CCXTFeed,
+                   symbol: str, base: str) -> None:
+    """Reach every non-price provider once and report what each actually said.
+
+    This is the answer to "are the feed URLs in the source real?" -- not a
+    docstring's claim, but a fetch, right now, from this machine.
+    """
+    from .sources.defillama import DefiLlamaSource
+    from .sources.derivatives import DerivativesSource
+    from .sources.fear_greed import FearGreedSource
+    from .sources.news import NewsSource, parse_feed_list
+    from .sources.orderbook import OrderBookSource
+
+    if settings.enable_fundamental_leg:
+        derivatives = DerivativesSource(feed._client)
+        if not derivatives.available:
+            report.add("funding / OI", WARN, f"{settings.exchange_id} does not expose these over ccxt",
+                       "The fundamental leg loses two components. Venues that do expose them "
+                       "include binance, bybit and okx.")
+        else:
+            reading = derivatives.read(symbol)
+            if reading.has_anything:
+                parts = []
+                if reading.funding_rate is not None:
+                    parts.append(f"funding {reading.funding_rate * 100:+.4f}%")
+                if reading.open_interest is not None:
+                    parts.append(f"open interest {reading.open_interest:,.0f}")
+                report.add("funding / OI", PASS, f"{symbol}: {', '.join(parts)}")
+            else:
+                report.add("funding / OI", WARN, f"no perpetual listed for {symbol}",
+                           "Normal for a spot-only pair; other candidates may still have one.")
+
+        book = OrderBookSource(feed._client).read(symbol)
+        if book is None:
+            report.add("order book", WARN, f"no readable book for {symbol}",
+                       "Either the venue withholds it or the book is below the depth floor.")
+        else:
+            report.add("order book", PASS,
+                       f"{symbol}: {book.imbalance:+.0%} imbalance on "
+                       f"{book.total_notional / 1e6:.1f}M resting near mid")
+
+        llama = DefiLlamaSource()
+        try:
+            probe_tvl = llama.read(base) or llama.read("AAVE")
+            if probe_tvl is None:
+                report.add("DefiLlama", WARN, "reachable but nothing matched",
+                           "TVL abstains for coins that are not protocols, which is most of them.")
+            else:
+                report.add("DefiLlama", PASS,
+                           f"{probe_tvl.protocol} ${probe_tvl.tvl_usd / 1e6:,.0f}M TVL")
+        finally:
+            llama.close()
+
+    if settings.enable_sentiment_leg:
+        fng = FearGreedSource()
+        try:
+            regime = fng.read()
+            if regime is None:
+                report.add("Fear & Greed", WARN, "alternative.me did not answer",
+                           "The macro-regime component abstains; the rest of the leg still votes.")
+            else:
+                report.add("Fear & Greed", PASS, f"{regime.value:.0f} ({regime.label})")
+        finally:
+            fng.close()
+
+        import os
+
+        feeds = parse_feed_list(os.environ.get("CS_NEWS_FEEDS", ""))
+        news = NewsSource(feeds=feeds, cryptopanic_token=settings.cryptopanic_token)
+        try:
+            items = news.items(settings.news_window_hours)
+            alive = [url for url, state in news.feed_health.items() if state != "unreachable"]
+            dead = [url for url, state in news.feed_health.items() if state == "unreachable"]
+            # Never FAIL: a silent news feed degrades the sentiment leg but
+            # cannot stop the pipeline, and `doctor` exits non-zero only when
+            # the pipeline genuinely cannot run.
+            status = PASS if items else WARN
+            report.add("news feeds", status,
+                       f"{len(items)} headline(s) from {len(alive)}/{len(news.feed_health)} feed(s) "
+                       f"in the last {settings.news_window_hours:.0f}h",
+                       ("Feeds that did not answer: " + ", ".join(dead) +
+                        ". Override the list with CS_NEWS_FEEDS." if dead else ""))
+        finally:
+            news.close()
+
+
+def _check_execution(report: Report, settings: Settings) -> None:
+    from .execution.risk import LIVE_CONFIRMATION_PHRASE, ExecutionMode, RiskManager
+
+    risk = RiskManager(settings)
+    mode = risk.mode
+    if mode == ExecutionMode.DISABLED:
+        report.add("execution", PASS, "disabled -- signals only, no orders (the default)")
+        return
+
+    problem = risk.startup_error()
+    if problem:
+        report.add("execution", FAIL, "live mode is configured but incomplete",
+                   problem.replace("\n", " ").replace("    ", ""))
+        return
+
+    if mode == ExecutionMode.PAPER:
+        report.add("execution", PASS,
+                   f"PAPER -- orders recorded against real prices, nothing sent. "
+                   f"Risking {settings.risk_per_trade_pct:g}% per trade, "
+                   f"max {settings.max_order_notional:,.0f} per order")
+        return
+
+    report.add("execution", WARN,
+               f"LIVE -- this process will place REAL orders. "
+               f"Max {settings.max_order_notional:,.0f}/order, "
+               f"{settings.max_open_positions} position(s), "
+               f"{settings.max_daily_loss:,.0f} daily loss limit",
+               f"Confirmed via CS_LIVE_CONFIRM. Unset it to stop trading immediately. "
+               f"(The phrase is: {LIVE_CONFIRMATION_PHRASE})")

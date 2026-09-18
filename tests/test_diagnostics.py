@@ -14,7 +14,7 @@ from dataclasses import replace
 import pytest
 from support import BAR_MS, make_candles, trend_closes
 
-from cryptosignal.diagnostics import FAIL, WARN, diagnose
+from cryptosignal.diagnostics import FAIL, PASS, WARN, diagnose
 from cryptosignal.exchange import CCXTFeed, FeedError, explain_exchange_error
 
 
@@ -75,15 +75,58 @@ def by_name(report):
 # ---- the happy path --------------------------------------------------------
 
 
+def core_settings(settings, **overrides):
+    """The price path only -- the phase 2 and 3 providers reach the network."""
+    return replace(settings, request_spacing_ms=0, min_quote_volume_24h=1e6,
+                   database_path=":memory:", enable_fundamental_leg=False,
+                   enable_sentiment_leg=False, **overrides)
+
+
 def test_a_healthy_venue_passes_every_stage(settings):
-    configured = replace(settings, request_spacing_ms=0, min_quote_volume_24h=1e6,
-                         database_path=":memory:")
+    configured = core_settings(settings)
     report = diagnose(configured, feed_for(configured, ohlcv=real_rows()))
 
     assert report.ok
     names = [c.name for c in report.checks]
     assert names == ["exchange", "markets", "timeframe", "live price", "stage 1",
-                     "candles", "indicators", "scoring", "rate budget", "alerts", "database"]
+                     "candles", "indicators", "scoring", "rate budget", "alerts",
+                     "execution", "database"]
+
+
+def test_execution_is_reported_as_off_by_default(settings):
+    configured = core_settings(settings)
+    report = diagnose(configured, feed_for(configured, ohlcv=real_rows()))
+    check = by_name(report)["execution"]
+    assert check.status == PASS
+    assert "disabled" in check.detail
+
+
+def test_paper_execution_is_reported_with_its_limits(settings):
+    configured = core_settings(settings, execution_mode="paper")
+    report = diagnose(configured, feed_for(configured, ohlcv=real_rows()))
+    check = by_name(report)["execution"]
+    assert "PAPER" in check.detail
+    assert report.ok
+
+
+def test_an_incomplete_live_configuration_fails_the_preflight(settings):
+    configured = core_settings(settings, execution_mode="live")
+    report = diagnose(configured, feed_for(configured, ohlcv=real_rows()))
+    check = by_name(report)["execution"]
+    assert check.status == FAIL
+    assert "CS_LIVE_CONFIRM" in check.fix
+    assert not report.ok
+
+
+def test_a_silent_secondary_provider_never_fails_the_preflight(settings):
+    """A dead news feed degrades a leg; it does not stop the pipeline running."""
+    configured = replace(settings, request_spacing_ms=0, min_quote_volume_24h=1e6,
+                         database_path=":memory:")
+    report = diagnose(configured, feed_for(configured, ohlcv=real_rows()))
+
+    names = [c.name for c in report.checks]
+    assert "news feeds" in names and "Fear & Greed" in names
+    assert report.ok        # every secondary check is PASS or WARN, never FAIL
 
 
 def test_it_reports_a_real_price_not_a_placeholder(settings):
@@ -212,8 +255,7 @@ def test_a_venue_rate_limit_slower_than_ours_wins(settings):
 
 
 def test_missing_alert_channels_warn_without_blocking(settings):
-    configured = replace(settings, request_spacing_ms=0, min_quote_volume_24h=1e6,
-                         telegram_bot_token="", webhook_url="", database_path=":memory:")
+    configured = core_settings(settings, telegram_bot_token="", webhook_url="")
     report = diagnose(configured, feed_for(configured, ohlcv=real_rows()))
 
     assert by_name(report)["alerts"].status == WARN
@@ -221,9 +263,8 @@ def test_missing_alert_channels_warn_without_blocking(settings):
 
 
 def test_configured_channels_are_named(settings):
-    configured = replace(settings, request_spacing_ms=0, min_quote_volume_24h=1e6,
-                         telegram_bot_token="t", telegram_chat_id="c",
-                         webhook_url="https://example.invalid/h", database_path=":memory:")
+    configured = core_settings(settings, telegram_bot_token="t", telegram_chat_id="c",
+                               webhook_url="https://example.invalid/h")
     report = diagnose(configured, feed_for(configured, ohlcv=real_rows()))
 
     assert by_name(report)["alerts"].detail == "telegram, webhook"

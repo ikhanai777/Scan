@@ -27,6 +27,10 @@ VWAP_PERIOD = 48
 OBV_SLOPE_BARS = 14
 # How far back a break of structure still counts as "fresh".
 BREAK_LOOKBACK = 6
+#: Window for the plain price change the fundamental leg reads open
+#: interest against -- rising OI means nothing until you know which way
+#: price went while it rose.
+RETURN_BARS = 14
 SWING_LEFT = 3
 SWING_RIGHT = 3
 
@@ -61,6 +65,7 @@ class TechnicalFeatures:
     macd_scale: float           # ATR, used to make the histogram comparable across coins
     stoch_k: float
     stoch_d: float
+    recent_return_pct: float    # price change over RETURN_BARS, in percent
 
     atr: float
     atr_pct: float              # ATR as a percent of price
@@ -157,6 +162,7 @@ def compute_features(candles: Candles) -> TechnicalFeatures | None:
         macd_hist_prev=float(macd_hist[-2]) if macd_hist.size >= 2 and math.isfinite(macd_hist[-2]) else float("nan"),
         macd_scale=atr_now,
         stoch_k=_last(stoch_k), stoch_d=_last(stoch_d),
+        recent_return_pct=_recent_return(close),
         atr=atr_now,
         atr_pct=100.0 * atr_now / close[-1] if math.isfinite(atr_now) and close[-1] > 0 else float("nan"),
         atr_expansion=atr_expansion,
@@ -174,6 +180,16 @@ def compute_features(candles: Candles) -> TechnicalFeatures | None:
         distance_to_resistance_atr=to_resistance,
         distance_to_support_atr=to_support,
     )
+
+
+def _recent_return(close: np.ndarray) -> float:
+    """Percent change over the return window, or nan with too little history."""
+    if close.size <= RETURN_BARS:
+        return float("nan")
+    earlier = close[-RETURN_BARS - 1]
+    if earlier <= 0:
+        return float("nan")
+    return float(100.0 * (close[-1] - earlier) / earlier)
 
 
 def _structure(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> tuple[float, float, bool, bool]:

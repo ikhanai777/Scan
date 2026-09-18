@@ -131,6 +131,30 @@
   .drv i.pos { color: var(--long); } .drv i.neg { color: var(--short); }
   .drv b { color: var(--text); font-weight: 600; min-width: 74px; }
 
+  .legs { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 9px; }
+  .leg {
+    display: flex; align-items: baseline; gap: 5px; font-size: 10.5px;
+    background: #0b111c; border: 1px solid var(--line); border-radius: 4px; padding: 3px 7px;
+  }
+  .leg u { text-decoration: none; color: var(--text-faint); letter-spacing: .08em; text-transform: uppercase; font-size: 9.5px; }
+  .leg b { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .leg b.pos { color: var(--long); } .leg b.neg { color: var(--short); }
+  .leg.silent { opacity: .45; }
+
+  .src-row { display: flex; align-items: center; gap: 8px; padding: 6px 14px; font-size: 11.5px; border-bottom: 1px solid rgba(27,36,54,.5); }
+  .src-row:last-child { border-bottom: 0; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+  .dot.on { background: var(--long); }
+  .dot.off { background: var(--text-faint); }
+  .src-row span { color: var(--text-dim); }
+  .src-row em { font-style: normal; margin-left: auto; color: var(--text-faint); font-size: 10.5px; }
+
+  .exec-mode { display: inline-block; font-size: 10px; letter-spacing: .12em; padding: 2px 7px; border-radius: 3px; font-weight: 700; }
+  .exec-mode.disabled { background: #1a2333; color: var(--text-faint); }
+  .exec-mode.paper { background: rgba(77,159,255,.16); color: var(--accent); }
+  .exec-mode.live { background: rgba(255,77,109,.18); color: var(--short); }
+  .exec-warn { padding: 9px 14px; font-size: 11px; color: var(--warn); border-top: 1px solid var(--line); }
+
   .card-foot { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; font-size: 11px; color: var(--text-faint); border-top: 1px solid var(--line); padding-top: 9px; }
   .countdown { font-variant-numeric: tabular-nums; color: var(--accent); }
   .countdown.expiring { color: var(--warn); }
@@ -201,6 +225,15 @@
       <div class="perf" id="perf"></div>
     </section>
     <section class="panel">
+      <h2>execution <em id="exec-mode"></em></h2>
+      <div class="perf" id="exec"></div>
+      <div class="exec-warn" id="exec-warn" hidden></div>
+    </section>
+    <section class="panel">
+      <h2>data sources</h2>
+      <div id="sources"></div>
+    </section>
+    <section class="panel">
       <h2>feed</h2>
       <div class="perf" id="cycle"></div>
     </section>
@@ -253,6 +286,21 @@ function passesFilters(s) {
   return true;
 }
 
+const LEG_NAMES = ["technical", "fundamental", "sentiment"];
+
+function legsHTML(scores) {
+  // A leg that did not report is shown greyed with a dash, never as a zero.
+  // "Silent" and "neutral" are different facts and the card has to say which.
+  return LEG_NAMES.map((name) => {
+    const value = scores && scores[name];
+    const silent = value === undefined || value === null;
+    const cls = silent ? "" : (value >= 0 ? "pos" : "neg");
+    const text = silent ? "--" : (value >= 0 ? "+" : "") + value.toFixed(0);
+    return `<span class="leg ${silent ? "silent" : ""}" title="${silent ? name + " leg had no data" : name + " leg"}">
+      <u>${name.slice(0, 4)}</u><b class="${cls}">${text}</b></span>`;
+  }).join("");
+}
+
 function cardHTML(s) {
   const isOpen = s.status === "open" || s.status === "target1";
   const drivers = (s.drivers || []).map((d) => `
@@ -287,6 +335,7 @@ function cardHTML(s) {
         <div class="lv tp"><u>target 1</u><b>${fmtNum(s.target1)}</b><small> ${s.rr_target1}R</small></div>
         <div class="lv tp"><u>target 2</u><b>${fmtNum(s.target2)}</b><small> ${s.rr_target2}R</small></div>
       </div>
+      <div class="legs">${legsHTML(s.leg_scores)}</div>
       <div class="drivers">${drivers}</div>
       <div class="card-foot">
         ${isOpen ? `<span class="countdown" data-expires="${s.expires_at}">--</span>` : `<span>window ${fmtDuration(s.hold_minutes)}</span>`}
@@ -379,6 +428,87 @@ function renderCycle(cycle) {
   renderWatch(cycle);
 }
 
+function renderExecution(data) {
+  const mode = data.enabled === false ? "disabled" : (data.risk && data.risk.mode) || "disabled";
+  $("exec-mode").innerHTML = `<span class="exec-mode ${mode}">${mode}</span>`;
+  const warn = $("exec-warn");
+
+  if (data.enabled === false) {
+    // "off" and "not running in this process" are different facts.
+    const message = data.attached === false
+      ? "The scanner is not in this process, so there is nothing to report here."
+      : "Signals only. No orders are placed.";
+    $("exec").innerHTML = `<div style="grid-column:1/-1;color:var(--text-faint);font-size:11px">${message}</div>`;
+    $("exec-mode").innerHTML = data.attached === false
+      ? `<span class="exec-mode disabled">not attached</span>`
+      : `<span class="exec-mode disabled">disabled</span>`;
+    warn.hidden = true;
+    return;
+  }
+
+  const risk = data.risk || {};
+  const limits = risk.limits || {};
+  $("exec").innerHTML = `
+    <div><u>open</u><b>${(data.open || []).length}</b></div>
+    <div><u>orders today</u><b>${risk.orders_today ?? 0}</b></div>
+    <div><u>pnl today</u><b>${(risk.realized_pnl_today ?? 0).toFixed(2)}</b></div>
+    <div><u>max / order</u><b>${(limits.max_order_notional ?? 0).toLocaleString()}</b></div>
+    <div><u>risk / trade</u><b>${limits.risk_per_trade_pct ?? "--"}%</b></div>
+    <div><u>daily loss cap</u><b>${(limits.max_daily_loss ?? 0).toLocaleString()}</b></div>`;
+
+  if (risk.killed) {
+    warn.hidden = false;
+    warn.textContent = `\u26a0 kill switch engaged: ${risk.kill_reason}`;
+  } else if (risk.daily_limit_tripped) {
+    warn.hidden = false;
+    warn.textContent = "\u26a0 daily loss limit tripped -- no further orders today";
+  } else if (mode === "live") {
+    warn.hidden = false;
+    warn.textContent = "\u26a0 LIVE mode: this process places real orders with real money.";
+  } else {
+    warn.hidden = true;
+  }
+}
+
+function renderSources(data) {
+  const rows = [];
+  const legs = data.legs || {};
+  const reporting = data.reporting || {};
+  const labels = {
+    derivatives: "funding & open interest",
+    orderbook: "order book",
+    defillama: "DefiLlama TVL",
+    news: "news feeds",
+    fear_greed: "Fear & Greed",
+  };
+
+  if (data.attached === false) {
+    $("sources").innerHTML = `<div class="empty">the scanner is not in this process<span>run \`serve --scan\` to see source health</span></div>`;
+    return;
+  }
+
+  for (const [key, label] of Object.entries(labels)) {
+    const on = reporting[key] === true;
+    const known = key in reporting;
+    rows.push(`<div class="src-row">
+      <span class="dot ${on ? "on" : "off"}"></span>
+      <span>${label}</span>
+      <em>${known ? (on ? "reporting" : "silent") : "not polled"}</em>
+    </div>`);
+  }
+  if (!legs.fundamental || !legs.sentiment) {
+    const off = [!legs.fundamental && "fundamental", !legs.sentiment && "sentiment"]
+      .filter(Boolean).join(" and ");
+    rows.push(`<div class="src-row"><span class="dot off"></span>
+      <span style="color:var(--text-faint)">${off} leg disabled by config</span></div>`);
+  }
+  if (data.regime) {
+    rows.push(`<div class="src-row"><span class="dot on"></span>
+      <span>market regime</span><em>${data.regime.value.toFixed(0)} ${data.regime.label}</em></div>`);
+  }
+  $("sources").innerHTML = rows.join("");
+}
+
 /* ---- data ---- */
 
 async function load(path) {
@@ -389,14 +519,17 @@ async function load(path) {
 
 async function refreshAll() {
   try {
-    const [signals, perf, status] = await Promise.all([
+    const [signals, perf, status, exec, sources] = await Promise.all([
       load("/api/signals?limit=100"), load("/api/performance"), load("/api/status"),
+      load("/api/execution"), load("/api/sources"),
     ]);
     state.signals.clear();
     signals.signals.forEach((s) => state.signals.set(s.id, s));
     renderFeed();
     renderPerformance(perf.performance);
     renderCycle(status.cycle);
+    renderExecution(exec);
+    renderSources(sources);
   } catch (err) {
     console.error("refresh failed", err);
     $("pulse").className = "pulse dead";
