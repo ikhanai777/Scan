@@ -201,6 +201,66 @@ each coin's own volatility:
 
 ---
 
+## Accuracy: the filters that run before a setup is considered
+
+Three things separate a signal engine that works from one that produces
+plausible-looking noise. None of them is another indicator.
+
+### Higher-timeframe confluence
+
+Taking a 15-minute long into a 4-hour downtrend is the most reliable way to
+lose money with a working indicator set. The lower timeframe times the entry;
+the higher one decides whether you should be looking for that entry at all.
+
+It does **not** hard-veto every counter-trend signal — every reversal starts as
+one, and a blanket veto misses all of them. An aligned trend raises the score,
+a weakly opposed one cuts it, and only a strong opposed trend vetoes outright.
+The 4h series is cached for 15 minutes, because a 4h candle changes four times
+a day and refetching it every cycle spends rate budget to learn nothing.
+
+### Regime
+
+The same indicator means different things in different markets. A break of
+resistance in a trend is continuation; the same break in a chop is the top of
+the range. Regime is classified from **Kaufman's efficiency ratio** — net
+distance travelled over the total path walked to get there — combined with ADX
+and a volatility percentile:
+
+| Regime | What it means | Default |
+|---|---|---|
+| trending | directional path, ADX confirms | trade it |
+| ranging | going sideways with structure | trade it |
+| volatile | big moves, no direction | trade it, wider stops |
+| choppy | price going nowhere through a lot of small moves | **skipped** |
+
+Chop is where indicator systems bleed. The regime is shown on every card, so
+"this fired in a chop" is visible before you size it.
+
+### Correlation and portfolio heat
+
+**Eight open longs on eight alts is one bet, not eight.** Alt returns are
+dominated by a single common factor, and in a sell-off pairwise correlation
+converges toward 1.0. A scanner that ranks setups independently and fires the
+top eight opens eight positions that are the same position — and a book that
+looks diversified at 0.5% risk each is really one 4% bet that resolves
+together.
+
+So exposure is counted **correlation-weighted**, not by position count:
+
+```
+effective = own risk + Σ max(0, correlation) × other position's risk
+```
+
+A new long 0.9 correlated with three open longs adds nearly its full risk to
+that total, and once it passes the budget no further same-direction signals
+fire. Two deliberate choices: opposite-side positions in correlated coins are
+**netted, not summed** (they partly hedge, and blocking them would block the
+one combination that reduces risk), and a correlation that **cannot be
+measured is assumed high** rather than assumed free.
+
+The dashboard reports *effective bets* — four copies of one trade shows as
+~1.2, not 4.
+
 ## Outcome tracking
 
 Every signal is written down the moment it fires, with the levels it fired at,
@@ -216,13 +276,31 @@ pessimistic:
 `cryptosignal stats` and `/api/performance` report closed count, hit rate,
 expectancy in R, total R, max drawdown, average hold, and a long/short split.
 
+### Every price event carries a timestamp
+
+A closed signal's first question is *where did this start, when did it hit, and
+at what price*. Each signal keeps a timeline, and the card shows it:
+
+```
+09:32:36   FIRED      106.1041 · long @ 47% confidence
+10:48:12   TARGET1    108.2648 · target 1 108.157 hit, running to target 2
+11:19:40   TARGET     109.6817 · target 2 109.572 hit
+```
+
+The backtest records the same thing as **fills** — a partial exit at target 1
+and the remainder stopping at breakeven is two fills at two times and two
+prices, and collapsing them into one "exit" loses exactly the detail you need
+to audit the trade. Fill timestamps come from the candle's own open time, never
+from the clock.
+
 ---
 
-## Backtesting (phase 4)
+## Backtesting
 
 ```bash
 cryptosignal backtest --top 5 --bars 2000      # real history from your venue
 cryptosignal sweep --min-trades 30             # tune against it
+cryptosignal walkforward --folds 4             # tune on one window, judge on the next
 ```
 
 Both run on OHLCV paged from the exchange. There is no simulated price series:
@@ -235,6 +313,57 @@ if the venue will not serve the history, the backtest does not run.
 2. **The stop is checked before the target, inside every bar**, against the real
    high and low.
 3. **An expiry is marked to the close** of the bar where the window ran out.
+
+### Costs, because a costless backtest is fiction
+
+Every fill is charged: the entry pays the **maker** fee (it is a post-only
+limit order), each exit pays **taker plus half the spread plus slippage scaled
+by ATR** — a market order during the move that triggered your stop is exactly
+when the book is thinnest.
+
+The arithmetic is brutal and worth seeing. At a 1.5-ATR stop on a coin whose
+ATR is 0.5% of price, a round trip costs roughly **0.04R**. A system doing 200
+trades a year at +0.08R expectancy just lost half its edge; one at +0.04R lost
+all of it. So the summary reports gross expectancy, net expectancy, and the
+cost per trade separately — the gap between the first two is the thing most
+backtests hide.
+
+### Target 1 is an exit, not a note in the log
+
+A configurable fraction (default half) comes off at target 1 and the stop moves
+to breakeven. Recording T1 and then letting the whole position ride back to the
+original stop measures a strategy nobody actually trades.
+
+### Walk-forward, because a sweep is fitting by definition
+
+`sweep` optimises and reports on the same window, which is not evidence — it is
+a description of that window. `walkforward` splits history into consecutive
+folds, fits on each in-sample block, and reports only on the **next** block,
+which the optimiser never saw:
+
+```
+  fold 0: in-sample +0.412R (63 trades)  ->  out-of-sample +0.081R (24 trades)
+  fold 1: in-sample +0.377R (58 trades)  ->  out-of-sample -0.042R (21 trades)
+  verdict: more than half the in-sample edge vanished out of sample --
+           treat the tuning as noise-fitting
+```
+
+*(Shape of the output, not a recorded run.)* The **degradation** — in-sample
+minus out-of-sample — is the size of the self-deception, and it is reported as
+a number.
+
+### Significance, because twelve trades is not a hit rate
+
+Every backtest summary carries a bootstrap: the trades are resampled with
+replacement, and the middle 90% of the resulting expectancies is reported. If
+that interval straddles zero, the honest summary is *"cannot be distinguished
+from noise"*, however good the point estimate looks — and the report says how
+many trades would be needed before it could be.
+
+A Monte Carlo on trade **order** answers a different question that ruins more
+accounts than expectancy does: the same trades in a different sequence produce
+a different worst drawdown, and the one you got was a single draw. Sizing
+against it alone is sizing against one sample.
 
 `sweep` ranks configurations by expectancy but sorts anything below
 `--min-trades` beneath everything that clears it. Four trades and a perfect
@@ -307,6 +436,8 @@ updates over server-sent events.
 | `GET /api/performance` | the track record |
 | `GET /api/sources` | which providers answered on the last cycle |
 | `GET /api/execution` | order state and the risk limits |
+| `GET /api/risk` | correlation between open positions, and effective bets |
+| `GET /api/regimes` | what kind of market each scanned coin is in |
 | `GET /api/status` | last cycle plus the resolved tuning |
 | `GET /api/features/{symbol}` | the indicator readings behind a score |
 | `GET /api/stream` | server-sent events |
@@ -331,7 +462,7 @@ ones is the point; halting both would leave open positions ungraded.
 ## Testing, and what is real
 
 ```bash
-make dev && make test        # 337 tests, 14 skipped until you record fixtures
+make dev && make test        # 409 tests, 14 skipped until you record fixtures
 make lint
 ```
 
@@ -409,9 +540,12 @@ the setup weights must each sum to 1.0 or the process refuses to start.
 
 - **No part of this has met a live order book yet.** `doctor` first, then a real
   cycle. That is the first real evidence.
-- **The weights and the lexicon are reasoned, not fitted.** `sweep` against your
-  own venue's history is what turns them into something evidenced — and a
-  configuration that only wins on one window is fitted noise.
+- **The weights and the lexicon are reasoned, not fitted.** Run
+  `cryptosignal walkforward` before trusting any tuning: it is the only number
+  that resembles what you would have experienced. A `sweep` result alone is a
+  description of one window.
+- **Check the cost model against your venue's real fee tier.** The defaults are
+  pessimistic on purpose, but they are defaults.
 - **Paper before live**, for long enough that the track record means something.
   The published hit rate is the only evidence the tuning works.
 - Distributing "trading signals" may need local financial-services registration

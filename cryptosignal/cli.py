@@ -11,6 +11,7 @@
     cryptosignal backtest           replay the engine over real history
     cryptosignal sweep              tune parameters against real history
     cryptosignal record             capture real market data as test fixtures
+    cryptosignal walkforward        tune on one window, judge on the next
 """
 
 from __future__ import annotations
@@ -115,12 +116,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     from .api.app import create_app, run_scanner_in_background
 
-    store = Store(settings.database_path)
     scanner = None
     if args.scan:
-        feed = CCXTFeed(settings)
-        scanner = Scanner(settings, feed, store, build_notifiers(settings))
+        scanner, store = _build_scanner()
         run_scanner_in_background(scanner)
+    else:
+        store = Store(settings.database_path)
 
     app = create_app(settings, store, scanner)
     host = args.host or settings.api_host
@@ -167,13 +168,72 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         print("\n  No history came back. Run `cryptosignal doctor` first.\n")
         return 1
 
-    summary = backtest_many(histories, settings).to_dict()
+    from .validation import summarise
+
+    summary = summarise(backtest_many(histories, settings))
     print()
     print(json.dumps(summary, indent=2))
+    stats = summary.get("significance")
+    if stats:
+        print(f"\n  {stats['verdict']}.")
+        print(f"  Costs took {summary.get('cost_per_trade_r', 0)}R per trade "
+              f"({summary.get('gross_expectancy_r')} gross -> "
+              f"{summary.get('expectancy_r')} net).")
     if summary["trades"] == 0:
         print("\n  No signal fired over this window. That is a result, not a failure:\n"
               "  widen the window, lower the threshold band, or add symbols.\n")
     return 0
+
+
+def cmd_walkforward(args: argparse.Namespace) -> int:
+    """Optimise on each block of history, report only on the block after it."""
+    from .validation import walk_forward
+
+    grid = {"long_threshold": [55.0, 60.0, 65.0, 70.0],
+            "stop_atr_multiple": [1.25, 1.5, 2.0]}
+    if args.grid:
+        try:
+            grid = json.loads(args.grid)
+        except ValueError as exc:
+            print(f"--grid must be JSON: {exc}")
+            return 1
+
+    feed = CCXTFeed(settings)
+    symbols = _resolve_symbols(feed, args.symbols, args.top)
+    print(f"\n  walk-forward over {len(symbols)} symbol(s), "
+          f"{args.folds} folds of {args.bars} bars\n")
+
+    every_out_of_sample = []
+    for symbol in symbols:
+        candles = feed.history(symbol, args.bars)
+        if candles is None or len(candles) < 300:
+            print(f"  [skip] {symbol}: not enough history")
+            continue
+        result = walk_forward(candles, settings, grid, folds=args.folds)
+        summary = result.to_dict()
+        every_out_of_sample.extend(result.out_of_sample_trades)
+        print(f"  {symbol}")
+        for fold in summary["folds"]:
+            print(f"    fold {fold['fold']}: in-sample "
+                  f"{_fmt(fold['in_sample_expectancy_r'])} ({fold['in_sample_trades']} trades)"
+                  f"  ->  out-of-sample "
+                  f"{_fmt(fold['out_of_sample_expectancy_r'])} ({fold['out_of_sample_trades']} trades)"
+                  f"   {fold['chosen']}")
+        print(f"    verdict: {summary['verdict']}\n")
+
+    if every_out_of_sample:
+        from .validation import significance
+
+        stats = significance(every_out_of_sample)
+        if stats:
+            print("  combined out-of-sample, across every symbol:")
+            print(json.dumps(stats.to_dict(), indent=4))
+    print()
+    return 0
+
+
+def _fmt(value) -> str:
+    return "  n/a " if value is None else f"{value:+.3f}R"
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
@@ -211,8 +271,10 @@ def cmd_sweep(args: argparse.Namespace) -> int:
               f"{(summary['hit_rate'] or 0):>9.0f}%{summary['max_drawdown_r']:>8.1f}R   "
               f"{row.overrides}")
     print(f"\n  * fewer than {args.min_trades} trades -- not enough to tune on.")
-    print("  These results fit this window. A parameter set that only wins here\n"
-          "  is fitted noise; re-run over a different period before trusting it.\n")
+    print("  These results fit this window, and fitting is what a sweep does.\n"
+          "  Run `cryptosignal walkforward` before trusting any of them: it tunes\n"
+          "  on one block and reports on the next, which is the only number that\n"
+          "  resembles what you would have experienced.\n")
     return 0
 
 
@@ -295,6 +357,12 @@ def build_parser() -> argparse.ArgumentParser:
                               help="below this a result is not evidence")
     sweep_parser.add_argument("--show", type=int, default=15, help="rows to print")
     sweep_parser.set_defaults(func=cmd_sweep)
+
+    walk = sub.add_parser("walkforward", help="tune on one window, judge on the next")
+    add_history_args(walk, 4000)
+    walk.add_argument("--folds", type=int, default=4)
+    walk.add_argument("--grid", default=None, help="JSON parameter grid")
+    walk.set_defaults(func=cmd_walkforward)
 
     record_parser = sub.add_parser("record", help="capture real market data as test fixtures")
     add_history_args(record_parser, 600)

@@ -36,9 +36,11 @@ import itertools
 import logging
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from typing import Any
 
 from .config import Settings
+from .costs import CostModel
 from .features import MIN_BARS, compute_features
 from .fusion import fuse
 from .legs import score_technical
@@ -47,6 +49,32 @@ from .models import Candles, Direction, Levels, MarketSnapshot, timeframe_minute
 from .screen import setup_score
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Fill:
+    """One execution, with the clock time and the price it happened at.
+
+    A trade is a sequence of these, not a pair of numbers: a partial exit at
+    target 1 and the remainder stopping out at breakeven is two fills at two
+    different times and prices, and collapsing them to a single "exit" loses
+    exactly the detail you need to audit the trade afterwards.
+    """
+
+    kind: str                # entry | target1 | target2 | stop | breakeven | expiry
+    at: datetime             # wall clock, from the candle's own timestamp
+    price: float             # after costs -- what the fill was actually worth
+    fraction: float          # share of the original position this fill moved
+    r: float | None = None   # realised R on that share; None for the entry
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "at": self.at.isoformat(),
+            "price": self.price,
+            "fraction": round(self.fraction, 4),
+            "r": round(self.r, 3) if self.r is not None else None,
+        }
 
 
 @dataclass(frozen=True)
@@ -63,14 +91,46 @@ class BacktestTrade:
     composite: float
     confidence: float
     setup_score: float
-    outcome: str                  # target2 | target1 | stop | expired
-    realized_r: float
+    outcome: str                  # target2 | target1 | stop | breakeven | expired
+    realized_r: float             # net of costs -- the number that matters
     peak_r: float
     trough_r: float
+    entry_at: datetime
+    exit_at: datetime
+    fills: tuple[Fill, ...] = ()
+    gross_r: float = 0.0          # before costs, for measuring what costs took
+    cost_r: float = 0.0
 
     @property
     def bars_held(self) -> int:
         return self.exit_index - self.entry_index
+
+    @property
+    def minutes_held(self) -> float:
+        return (self.exit_at - self.entry_at).total_seconds() / 60.0
+
+    @property
+    def target1_at(self) -> datetime | None:
+        return next((f.at for f in self.fills if f.kind == "target1"), None)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "direction": self.direction.value,
+            "outcome": self.outcome,
+            "entry_at": self.entry_at.isoformat(),
+            "exit_at": self.exit_at.isoformat(),
+            "entry_price": self.entry_price,
+            "exit_price": self.exit_price,
+            "minutes_held": round(self.minutes_held, 1),
+            "realized_r": round(self.realized_r, 3),
+            "gross_r": round(self.gross_r, 3),
+            "cost_r": round(self.cost_r, 3),
+            "peak_r": round(self.peak_r, 2),
+            "trough_r": round(self.trough_r, 2),
+            "confidence": round(self.confidence, 1),
+            "fills": [f.to_dict() for f in self.fills],
+        }
 
 
 @dataclass
@@ -113,6 +173,19 @@ class BacktestResult:
     def avg_bars_held(self) -> float | None:
         return sum(t.bars_held for t in self.trades) / self.count if self.count else None
 
+    @property
+    def avg_minutes_held(self) -> float | None:
+        return sum(t.minutes_held for t in self.trades) / self.count if self.count else None
+
+    @property
+    def gross_expectancy_r(self) -> float | None:
+        """Expectancy before costs. The gap to `expectancy_r` is what costs took."""
+        return sum(t.gross_r for t in self.trades) / self.count if self.count else None
+
+    @property
+    def cost_per_trade_r(self) -> float | None:
+        return sum(t.cost_r for t in self.trades) / self.count if self.count else None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "symbol": self.symbol,
@@ -126,9 +199,14 @@ class BacktestResult:
             "total_r": round(self.total_r, 2),
             "max_drawdown_r": round(self.max_drawdown_r, 2),
             "avg_bars_held": round(self.avg_bars_held, 1) if self.avg_bars_held is not None else None,
+            "avg_minutes_held": round(self.avg_minutes_held, 1) if self.avg_minutes_held is not None else None,
+            "gross_expectancy_r": round(self.gross_expectancy_r, 3) if self.gross_expectancy_r is not None else None,
+            "cost_per_trade_r": round(self.cost_per_trade_r, 3) if self.cost_per_trade_r is not None else None,
+            "first_trade_at": self.trades[0].entry_at.isoformat() if self.trades else None,
+            "last_trade_at": self.trades[-1].exit_at.isoformat() if self.trades else None,
             "outcomes": {
                 name: sum(1 for t in self.trades if t.outcome == name)
-                for name in ("target2", "target1", "stop", "expired")
+                for name in ("target2", "target1", "stop", "breakeven", "expired")
             },
         }
 
@@ -160,6 +238,7 @@ def backtest_candles(candles: Candles, settings: Settings,
     the shipped technical leg.
     """
     score_leg = score_leg or score_technical
+    costs = CostModel.from_settings(settings)
     result = BacktestResult(candles.symbol, candles.timeframe, len(candles))
     if len(candles) < MIN_BARS + 5:
         return result
@@ -197,7 +276,8 @@ def backtest_candles(candles: Candles, settings: Settings,
         entry_price = candles.open[entry_index]
         trade = _walk_forward(candles, entry_index, entry_price, fusion.direction,
                               levels, minutes_per_bar, candidate.setup_score,
-                              fusion.composite, fusion.confidence)
+                              fusion.composite, fusion.confidence,
+                              costs, features.atr, settings)
         if trade is None:
             index += 1
             continue
@@ -210,47 +290,122 @@ def backtest_candles(candles: Candles, settings: Settings,
 
 def _walk_forward(candles: Candles, entry_index: int, entry_price: float,
                   direction: Direction, levels: Levels, minutes_per_bar: int,
-                  setup: float, composite: float, confidence: float) -> BacktestTrade | None:
-    """Grade a trade against the real bars that followed it."""
-    risk = abs(entry_price - levels.stop)
+                  setup: float, composite: float, confidence: float,
+                  costs: CostModel, atr: float, settings: Settings) -> BacktestTrade | None:
+    """Grade a trade against the real bars that followed it, fill by fill.
+
+    Two things happen here that a naive replay skips, and both change the
+    expectancy materially:
+
+    * **Costs are charged on every fill.** The entry pays the maker fee; each
+      exit pays taker plus half the spread plus volatility slippage.
+    * **Target 1 is an exit, not a milestone.** A configurable fraction comes
+      off there and the stop moves to breakeven, which is what the level is
+      for. Recording T1 and then letting the whole position ride back to the
+      original stop measures a strategy nobody trades.
+    """
+    sign = direction.sign
+    entry_fill = costs.entry_price(entry_price, direction)
+    # Risk is measured from the price actually paid, not the price hoped for.
+    risk = abs(entry_fill - levels.stop)
     if risk <= 0:
         return None
-    sign = direction.sign
+
+    at = _timestamp(candles, entry_index)
+    fills = [Fill("entry", at, entry_fill, 1.0, None)]
+
     max_bars = max(1, round(levels.hold_minutes / minutes_per_bar))
     last_index = min(len(candles) - 1, entry_index + max_bars)
 
+    stop = levels.stop
+    remaining = 1.0
+    realized = gross = 0.0
     peak = trough = 0.0
-    target1_hit = False
+    target1_done = False
+    # Whether the stop has actually been *moved*, which is not the same as
+    # whether target 1 was hit: with the breakeven move disabled the original
+    # stop still stands, and calling that exit "breakeven" would misreport it.
+    stop_moved = False
+    partial = max(0.0, min(1.0, settings.partial_exit_fraction))
+
+    def book(kind: str, index: int, level: float, share: float) -> tuple[float, float]:
+        """Charge the exit, record the fill, and return (net_r, gross_r)."""
+        price = costs.exit_price(level, direction, atr)
+        net = sign * (price - entry_fill) / risk
+        raw = sign * (level - entry_price) / risk
+        fills.append(Fill(kind, _timestamp(candles, index), price, share, net))
+        return net, raw
 
     for i in range(entry_index, last_index + 1):
         high, low = candles.high[i], candles.low[i]
-        best = (high - entry_price) * sign / risk if sign > 0 else (entry_price - low) / risk
-        worst = (low - entry_price) * sign / risk if sign > 0 else (entry_price - high) / risk
+        best = sign * ((high if sign > 0 else low) - entry_fill) / risk
+        worst = sign * ((low if sign > 0 else high) - entry_fill) / risk
         peak, trough = max(peak, best), min(trough, worst)
 
         # Rule 2: the stop is checked first, inside the bar.
-        if (sign > 0 and low <= levels.stop) or (sign < 0 and high >= levels.stop):
-            return BacktestTrade(candles.symbol, direction, entry_index, i, entry_price,
-                                 levels.stop, levels, composite, confidence, setup,
-                                 "stop", -1.0, peak, trough)
+        if (sign > 0 and low <= stop) or (sign < 0 and high >= stop):
+            kind = "breakeven" if stop_moved else "stop"
+            net, raw = book(kind, i, stop, remaining)
+            realized += remaining * net
+            gross += remaining * raw
+            return _finish(candles, entry_index, i, entry_fill, stop, direction, levels,
+                           composite, confidence, setup, kind, realized, gross,
+                           peak, trough, fills)
+
+        # Target 1: take the partial and move the stop to breakeven.
+        if not target1_done and ((sign > 0 and high >= levels.target1)
+                                 or (sign < 0 and low <= levels.target1)):
+            target1_done = True
+            if partial > 0:
+                net, raw = book("target1", i, levels.target1, partial)
+                realized += partial * net
+                gross += partial * raw
+                remaining -= partial
+            if settings.breakeven_after_target1:
+                stop = entry_fill
+                stop_moved = True
+            if remaining <= 1e-9:
+                return _finish(candles, entry_index, i, entry_fill, levels.target1, direction,
+                               levels, composite, confidence, setup, "target1",
+                               realized, gross, peak, trough, fills)
 
         if (sign > 0 and high >= levels.target2) or (sign < 0 and low <= levels.target2):
-            realized = abs(levels.target2 - entry_price) / risk
-            return BacktestTrade(candles.symbol, direction, entry_index, i, entry_price,
-                                 levels.target2, levels, composite, confidence, setup,
-                                 "target2", realized, peak, trough)
+            net, raw = book("target2", i, levels.target2, remaining)
+            realized += remaining * net
+            gross += remaining * raw
+            return _finish(candles, entry_index, i, entry_fill, levels.target2, direction,
+                           levels, composite, confidence, setup, "target2",
+                           realized, gross, peak, trough, fills)
 
-        if not target1_hit and ((sign > 0 and high >= levels.target1)
-                                or (sign < 0 and low <= levels.target1)):
-            target1_hit = True
+    # Rule 3: the window ran out. Mark the remainder to the final close.
+    exit_level = candles.close[last_index]
+    net, raw = book("expiry", last_index, exit_level, remaining)
+    realized += remaining * net
+    gross += remaining * raw
+    outcome = "target1" if target1_done else "expired"
+    return _finish(candles, entry_index, last_index, entry_fill, exit_level, direction,
+                   levels, composite, confidence, setup, outcome,
+                   realized, gross, peak, trough, fills)
 
-    # Rule 3: the window ran out. Mark to the close of the final bar.
-    exit_price = candles.close[last_index]
-    realized = sign * (exit_price - entry_price) / risk
-    outcome = "target1" if target1_hit else "expired"
-    return BacktestTrade(candles.symbol, direction, entry_index, last_index, entry_price,
-                         exit_price, levels, composite, confidence, setup,
-                         outcome, realized, peak, trough)
+
+def _finish(candles: Candles, entry_index: int, exit_index: int, entry_fill: float,
+            exit_level: float, direction: Direction, levels: Levels, composite: float,
+            confidence: float, setup: float, outcome: str, realized: float, gross: float,
+            peak: float, trough: float, fills: list[Fill]) -> BacktestTrade:
+    return BacktestTrade(
+        symbol=candles.symbol, direction=direction,
+        entry_index=entry_index, exit_index=exit_index,
+        entry_price=entry_fill, exit_price=fills[-1].price,
+        levels=levels, composite=composite, confidence=confidence, setup_score=setup,
+        outcome=outcome, realized_r=realized, peak_r=peak, trough_r=trough,
+        entry_at=_timestamp(candles, entry_index), exit_at=_timestamp(candles, exit_index),
+        fills=tuple(fills), gross_r=gross, cost_r=gross - realized,
+    )
+
+
+def _timestamp(candles: Candles, index: int) -> datetime:
+    """The candle's own open time, as a real UTC datetime."""
+    return datetime.fromtimestamp(candles.timestamps[index] / 1000.0, tz=UTC)
 
 
 def _slice(candles: Candles, end: int) -> Candles:

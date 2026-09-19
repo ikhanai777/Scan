@@ -148,6 +148,44 @@ class Settings:
     min_hold_minutes: int = field(default_factory=lambda: _env_int("CS_MIN_HOLD_MINUTES", 15))
     max_hold_minutes: int = field(default_factory=lambda: _env_int("CS_MAX_HOLD_MINUTES", 72 * 60))
 
+    # ---- higher-timeframe confluence and regime --------------------------
+    # Trading a 15m long into a 4h downtrend is the most reliable way to lose
+    # money with a working indicator set. This does not hard-veto every
+    # counter-trend signal -- a reversal always starts as one -- it scales the
+    # score, and vetoes only when the higher trend is both strong and opposed.
+    enable_htf_confluence: bool = field(default_factory=lambda: _env_bool("CS_ENABLE_HTF", True))
+    default_higher_timeframe: str = field(default_factory=lambda: _env_str("CS_HTF", "4h"))
+    htf_aligned_bonus: float = field(default_factory=lambda: _env_float("CS_HTF_BONUS", 0.10))
+    htf_opposed_penalty: float = field(default_factory=lambda: _env_float("CS_HTF_PENALTY", 0.50))
+    htf_veto_strength: float = field(default_factory=lambda: _env_float("CS_HTF_VETO", 0.70))
+    #: Chop is where indicator systems bleed; skipping it is usually free.
+    skip_choppy_regime: bool = field(default_factory=lambda: _env_bool("CS_SKIP_CHOP", True))
+
+    # ---- correlation / portfolio heat ------------------------------------
+    # Eight open longs on eight alts is one bet, not eight. Exposure is counted
+    # correlation-weighted, so a near-duplicate position costs its full risk
+    # rather than looking like diversification.
+    enable_correlation_control: bool = field(default_factory=lambda: _env_bool("CS_ENABLE_CORRELATION", True))
+    max_pair_correlation: float = field(default_factory=lambda: _env_float("CS_MAX_CORRELATION", 0.80))
+    #: Total correlation-weighted exposure, in units of one position's risk.
+    max_effective_exposure: float = field(default_factory=lambda: _env_float("CS_MAX_EXPOSURE", 3.0))
+    correlation_bars: int = field(default_factory=lambda: _env_int("CS_CORRELATION_BARS", 120))
+
+    # ---- execution costs -------------------------------------------------
+    # Charged in the backtest on every fill. Deliberately pessimistic: a
+    # strategy that survives costs slightly too high is a better bet than one
+    # tuned to costs slightly too low. Check your venue's actual fee tier.
+    maker_fee_bps: float = field(default_factory=lambda: _env_float("CS_MAKER_FEE_BPS", 2.0))
+    taker_fee_bps: float = field(default_factory=lambda: _env_float("CS_TAKER_FEE_BPS", 5.0))
+    assumed_spread_bps: float = field(default_factory=lambda: _env_float("CS_ASSUMED_SPREAD_BPS", 4.0))
+    slippage_atr_fraction: float = field(default_factory=lambda: _env_float("CS_SLIPPAGE_ATR", 0.05))
+
+    # ---- trade management ------------------------------------------------
+    # What comes off at target 1, and whether the stop then moves to breakeven.
+    # Setting the fraction to 0 makes target 1 a pure milestone again.
+    partial_exit_fraction: float = field(default_factory=lambda: _env_float("CS_PARTIAL_EXIT", 0.5))
+    breakeven_after_target1: bool = field(default_factory=lambda: _env_bool("CS_BREAKEVEN_AFTER_T1", True))
+
     # ---- scanner ---------------------------------------------------------
     scan_interval_seconds: float = field(default_factory=lambda: _env_float("CS_SCAN_INTERVAL_S", 120.0))
     # One open signal per coin at a time; stage 1 filters the rest out.
@@ -187,6 +225,12 @@ class Settings:
     api_host: str = field(default_factory=lambda: _env_str("CS_API_HOST", "127.0.0.1"))
     api_port: int = field(default_factory=lambda: _env_int("CS_API_PORT", 8000))
     dry_run: bool = field(default_factory=lambda: _env_bool("CS_DRY_RUN", False))
+
+    #: Which timeframe to check above each trading timeframe.
+    higher_timeframe_ladder: dict = field(default_factory=lambda: {
+        "1m": "15m", "3m": "30m", "5m": "1h", "15m": "4h",
+        "30m": "4h", "1h": "1d", "2h": "1d", "4h": "1d", "1d": "1w",
+    })
 
     DISCLAIMER: str = (
         "Not financial advice. Signals are decision support, not an auto-trader. "
@@ -252,6 +296,23 @@ class Settings:
         if self.max_open_positions < 1:
             raise ValueError("max_open_positions must be at least 1")
 
+        if not 0.0 < self.max_pair_correlation <= 1.0:
+            raise ValueError("max_pair_correlation must be in (0, 1]")
+        if self.max_effective_exposure <= 0:
+            raise ValueError("max_effective_exposure must be positive")
+
+        if not 0.0 <= self.htf_opposed_penalty <= 1.0:
+            raise ValueError("htf_opposed_penalty must be in [0, 1]")
+        if not 0.0 < self.htf_veto_strength <= 1.0:
+            raise ValueError("htf_veto_strength must be in (0, 1]")
+
+        if not 0.0 <= self.partial_exit_fraction <= 1.0:
+            raise ValueError("partial_exit_fraction must be in [0, 1]")
+        for name in ("maker_fee_bps", "taker_fee_bps", "assumed_spread_bps",
+                     "slippage_atr_fraction"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} cannot be negative")
+
     def as_dict(self) -> dict[str, object]:
         """Public view of the tuning, for the dashboard's config panel."""
         out: dict[str, object] = {}
@@ -261,6 +322,8 @@ class Settings:
                 out[f.name] = "set" if value else "unset"
             elif isinstance(value, tuple):
                 out[f.name] = list(value)
+            elif isinstance(value, dict):
+                out[f.name] = dict(value)
             else:
                 out[f.name] = value
         return out

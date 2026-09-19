@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 
-from .models import Direction, Signal, SignalStatus, utcnow
+from .models import Direction, Milestone, Signal, SignalStatus, utcnow
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -72,8 +72,9 @@ def _advance(signal: Signal, price: float, now: datetime) -> TrackerUpdate | Non
     if signal.status is SignalStatus.OPEN and _crossed(signal.direction, price, levels.target1, adverse=False):
         signal.status = SignalStatus.TARGET1
         signal.target1_hit_at = now
-        return TrackerUpdate(signal, "target1", price,
-                             f"target 1 {levels.target1:.6g} hit, running to target 2")
+        detail = f"target 1 {levels.target1:.6g} hit, running to target 2"
+        signal.milestones = (*signal.milestones, Milestone("target1", now, price, detail))
+        return TrackerUpdate(signal, "target1", price, detail)
 
     if now >= signal.expires_at:
         # The realised R is a field of its own; repeating it in the reason
@@ -97,6 +98,7 @@ def _close(signal: Signal, price: float, now: datetime, status: SignalStatus,
     signal.closed_at = now
     signal.close_price = price
     signal.close_reason = detail
+    signal.milestones = (*signal.milestones, Milestone(kind, now, price, detail))
     # Graded at the level for a stop or target -- that is where the exit sits --
     # and marked to market for an expiry.
     if status is SignalStatus.CLOSED_STOP:

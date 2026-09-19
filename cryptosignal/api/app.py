@@ -163,6 +163,37 @@ def create_app(settings: Settings | None = None, store: Store | None = None,
             "legs": legs,
         }
 
+    @app.get("/api/risk")
+    def risk() -> dict:
+        """How concentrated the open book really is."""
+        if scanner is None:
+            return {"attached": False}
+        heat = getattr(scanner, "heat", None)
+        snapshot = heat.snapshot(settings.correlation_bars) if heat else {}
+        return {
+            "attached": True,
+            "enabled": settings.enable_correlation_control,
+            **snapshot,
+            "limits": {
+                "max_pair_correlation": settings.max_pair_correlation,
+                "max_effective_exposure": settings.max_effective_exposure,
+            },
+        }
+
+    @app.get("/api/regimes")
+    def regimes() -> dict:
+        """What kind of market each scanned coin is in right now."""
+        if scanner is None:
+            return {"attached": False, "regimes": {}}
+        readings = getattr(scanner, "last_regimes", {}) or {}
+        return {
+            "attached": True,
+            "regimes": {
+                symbol: reading.to_dict()
+                for symbol, reading in readings.items() if reading is not None
+            },
+        }
+
     @app.get("/api/stream")
     async def stream() -> StreamingResponse:
         return StreamingResponse(_events(store, settings), media_type="text/event-stream",

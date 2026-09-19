@@ -141,6 +141,22 @@
   .leg b.pos { color: var(--long); } .leg b.neg { color: var(--short); }
   .leg.silent { opacity: .45; }
 
+  .regime { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; padding: 2px 6px; border-radius: 3px; }
+  .regime.trending { background: rgba(22,224,160,.14); color: var(--long); }
+  .regime.ranging  { background: rgba(77,159,255,.14); color: var(--accent); }
+  .regime.volatile { background: rgba(255,179,71,.16); color: var(--warn); }
+  .regime.choppy   { background: #1a2333; color: var(--text-faint); }
+
+  .timeline { display: flex; flex-direction: column; gap: 4px; margin: 9px 0 0; padding-top: 9px; border-top: 1px solid var(--line); }
+  .tl { display: grid; grid-template-columns: 70px 74px 1fr; gap: 9px; font-size: 11px; align-items: baseline; }
+  .tl time { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+  .tl b { font-size: 10px; letter-spacing: .07em; text-transform: uppercase; }
+  .tl b.fired { color: var(--accent); }
+  .tl b.target1, .tl b.target { color: var(--long); }
+  .tl b.stop { color: var(--short); }
+  .tl b.expired { color: var(--warn); }
+  .tl span { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+
   .src-row { display: flex; align-items: center; gap: 8px; padding: 6px 14px; font-size: 11.5px; border-bottom: 1px solid rgba(27,36,54,.5); }
   .src-row:last-child { border-bottom: 0; }
   .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
@@ -230,6 +246,11 @@
       <div class="exec-warn" id="exec-warn" hidden></div>
     </section>
     <section class="panel">
+      <h2>portfolio risk <em id="risk-eff"></em></h2>
+      <div class="perf" id="risk"></div>
+      <div id="risk-pairs"></div>
+    </section>
+    <section class="panel">
       <h2>data sources</h2>
       <div id="sources"></div>
     </section>
@@ -258,6 +279,10 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+// Driver details and close reasons come out of the database, so they are
+// escaped before they are interpolated into markup.
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmtNum = (v) => {
   if (v === null || v === undefined || Number.isNaN(v)) return "--";
   const a = Math.abs(v);
@@ -301,6 +326,21 @@ function legsHTML(scores) {
   }).join("");
 }
 
+function timelineHTML(s) {
+  // Every price event with the clock time it happened at. This is the first
+  // thing anyone asks of a closed signal: where did it start, when did it hit,
+  // and at what price.
+  const events = s.milestones || [];
+  if (!events.length) return "";
+  const rows = events.map((m) => `
+    <div class="tl">
+      <time>${new Date(m.at).toLocaleTimeString([], { hour12: false })}</time>
+      <b class="${m.kind}">${m.kind}</b>
+      <span>${fmtNum(m.price)}${m.detail ? ` <span style="color:var(--text-faint)">&middot; ${esc(m.detail)}</span>` : ""}</span>
+    </div>`).join("");
+  return `<div class="timeline">${rows}</div>`;
+}
+
 function cardHTML(s) {
   const isOpen = s.status === "open" || s.status === "target1";
   const drivers = (s.drivers || []).map((d) => `
@@ -324,6 +364,7 @@ function cardHTML(s) {
         <span class="badge">${s.direction.toUpperCase()}</span>
         <span class="sym">${s.symbol}</span>
         <span style="color:var(--text-faint);font-size:11px">setup ${s.setup_score.toFixed(0)} &middot; composite ${s.composite_score >= 0 ? "+" : ""}${s.composite_score.toFixed(0)}</span>
+        ${s.regime ? `<span class="regime ${s.regime}">${s.regime}</span>` : ""}
         <span class="conf">
           <span class="conf-bar"><i style="width:${s.confidence}%"></i></span>
           <b>${s.confidence.toFixed(0)}%</b>
@@ -337,9 +378,11 @@ function cardHTML(s) {
       </div>
       <div class="legs">${legsHTML(s.leg_scores)}</div>
       <div class="drivers">${drivers}</div>
+      ${timelineHTML(s)}
       <div class="card-foot">
         ${isOpen ? `<span class="countdown" data-expires="${s.expires_at}">--</span>` : `<span>window ${fmtDuration(s.hold_minutes)}</span>`}
         ${s.reduced_confidence ? `<span class="flag" title="${s.reduced_confidence_reason}">&#9888; reduced confidence</span>` : ""}
+        ${s.htf_note ? `<span style="color:var(--text-faint)">${esc(s.htf_note)}</span>` : ""}
         ${outcome}
       </div>
     </div>`;
@@ -509,6 +552,32 @@ function renderSources(data) {
   $("sources").innerHTML = rows.join("");
 }
 
+function renderRisk(data) {
+  if (data.attached === false) {
+    $("risk").innerHTML = `<div style="grid-column:1/-1;color:var(--text-faint);font-size:11px">
+      not running in this process</div>`;
+    $("risk-pairs").innerHTML = "";
+    $("risk-eff").textContent = "";
+    return;
+  }
+  const limits = data.limits || {};
+  // Effective positions is the number that matters: four copies of one trade
+  // is not four bets, and this is where that shows up.
+  $("risk-eff").textContent = data.enabled ? "" : "control off";
+  $("risk").innerHTML = `
+    <div><u>open</u><b>${data.open ?? 0}</b></div>
+    <div><u>effective bets</u><b>${data.effective_positions ?? "--"}</b></div>
+    <div><u>gross risk</u><b>${((data.gross_risk ?? 0) * 100).toFixed(2)}%</b></div>
+    <div><u>max correlation</u><b>${limits.max_pair_correlation ?? "--"}</b></div>`;
+
+  const pairs = data.most_correlated || [];
+  $("risk-pairs").innerHTML = pairs.length
+    ? pairs.map((p) => `<div class="src-row">
+        <span class="dot ${p.correlation >= (limits.max_pair_correlation ?? 0.8) ? "off" : "on"}"></span>
+        <span>${p.pair}</span><em>${p.correlation.toFixed(2)}</em></div>`).join("")
+    : "";
+}
+
 /* ---- data ---- */
 
 async function load(path) {
@@ -523,6 +592,7 @@ async function refreshAll() {
       load("/api/signals?limit=100"), load("/api/performance"), load("/api/status"),
       load("/api/execution"), load("/api/sources"),
     ]);
+    load("/api/risk").then(renderRisk).catch(() => {});
     state.signals.clear();
     signals.signals.forEach((s) => state.signals.set(s.id, s));
     renderFeed();

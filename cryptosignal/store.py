@@ -20,10 +20,20 @@ from .models import (
     Direction,
     Driver,
     Levels,
+    Milestone,
     ScanReport,
     Signal,
     SignalStatus,
 )
+
+
+def _column(row: sqlite3.Row, name: str):
+    """Read a column that may not exist in an older database file."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -55,6 +65,9 @@ CREATE TABLE IF NOT EXISTS signals (
     peak_r                    REAL NOT NULL DEFAULT 0,
     trough_r                  REAL NOT NULL DEFAULT 0,
     target1_hit_at            TEXT,
+    milestones_json           TEXT NOT NULL DEFAULT '[]',
+    regime                    TEXT NOT NULL DEFAULT '',
+    htf_note                  TEXT NOT NULL DEFAULT '',
     notes                     TEXT NOT NULL DEFAULT ''
 );
 
@@ -136,8 +149,8 @@ class Store:
                     hold_minutes, reduced_confidence, reduced_confidence_reason,
                     drivers_json, leg_scores_json, created_at, expires_at, status,
                     closed_at, close_price, close_reason, realized_r, peak_r, trough_r,
-                    target1_hit_at, notes
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    target1_hit_at, milestones_json, regime, htf_note, notes
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     signal.id, signal.symbol, signal.base, signal.direction.value,
@@ -152,7 +165,8 @@ class Store:
                     _iso(signal.created_at), _iso(signal.expires_at), signal.status.value,
                     _iso(signal.closed_at), signal.close_price, signal.close_reason,
                     signal.realized_r, signal.peak_r, signal.trough_r,
-                    _iso(signal.target1_hit_at), signal.notes,
+                    _iso(signal.target1_hit_at), _dump_milestones(signal.milestones),
+                    signal.regime, signal.htf_note, signal.notes,
                 ),
             )
         self.add_event(signal.id, "fired", signal.reference_price,
@@ -164,13 +178,15 @@ class Store:
             cursor.execute(
                 """
                 UPDATE signals SET status=?, closed_at=?, close_price=?, close_reason=?,
-                       realized_r=?, peak_r=?, trough_r=?, target1_hit_at=?, notes=?
+                       realized_r=?, peak_r=?, trough_r=?, target1_hit_at=?,
+                       milestones_json=?, notes=?
                  WHERE id=?
                 """,
                 (
                     signal.status.value, _iso(signal.closed_at), signal.close_price,
                     signal.close_reason, signal.realized_r, signal.peak_r, signal.trough_r,
-                    _iso(signal.target1_hit_at), signal.notes, signal.id,
+                    _iso(signal.target1_hit_at), _dump_milestones(signal.milestones),
+                    signal.notes, signal.id,
                 ),
             )
 
@@ -317,6 +333,31 @@ class Store:
         }
 
 
+def _dump_milestones(milestones: tuple[Milestone, ...]) -> str:
+    return json.dumps([
+        {"kind": m.kind, "at": _iso(m.at), "price": m.price, "detail": m.detail}
+        for m in milestones
+    ])
+
+
+def _load_milestones(raw: str | None) -> tuple[Milestone, ...]:
+    """Rows written before milestones existed simply have none."""
+    if not raw:
+        return ()
+    try:
+        entries = json.loads(raw)
+    except ValueError:
+        return ()
+    out = []
+    for entry in entries:
+        at = _parse(entry.get("at"))
+        if at is None:
+            continue
+        out.append(Milestone(str(entry.get("kind", "")), at,
+                             float(entry.get("price", 0.0)), str(entry.get("detail", ""))))
+    return tuple(out)
+
+
 def _row_to_signal(row: sqlite3.Row) -> Signal:
     drivers = tuple(
         Driver(label=d["label"], score=d["score"], weight=d["weight"], detail=d.get("detail", ""))
@@ -343,5 +384,9 @@ def _row_to_signal(row: sqlite3.Row) -> Signal:
         closed_at=_parse(row["closed_at"]), close_price=row["close_price"],
         close_reason=row["close_reason"], realized_r=row["realized_r"],
         peak_r=row["peak_r"], trough_r=row["trough_r"],
-        target1_hit_at=_parse(row["target1_hit_at"]), notes=row["notes"],
+        target1_hit_at=_parse(row["target1_hit_at"]),
+        milestones=_load_milestones(_column(row, "milestones_json")),
+        regime=_column(row, "regime") or "",
+        htf_note=_column(row, "htf_note") or "",
+        notes=row["notes"],
     )

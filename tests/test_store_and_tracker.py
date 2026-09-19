@@ -10,6 +10,7 @@ from cryptosignal.models import (
     Direction,
     Driver,
     Levels,
+    Milestone,
     ScanReport,
     Signal,
     SignalStatus,
@@ -265,3 +266,78 @@ def test_a_closed_signal_is_not_regraded(store):
 
     update_open_signals(store, {"BTC/USDT": 130.0})
     assert store.get_signal(signal.id).realized_r == first
+
+
+# ---- timestamped price events ----------------------------------------------
+
+
+def test_a_fired_signal_opens_its_timeline(store):
+    """The first question of any closed signal is where it started and when."""
+    signal = make_signal()
+    signal.milestones = (Milestone("fired", signal.created_at, 100.0, "long @ 70%"),)
+    store.insert_signal(signal)
+
+    loaded = store.get_signal(signal.id)
+    assert [m.kind for m in loaded.milestones] == ["fired"]
+    assert loaded.milestones[0].price == pytest.approx(100.0)
+    assert loaded.milestones[0].at == signal.created_at
+
+
+def test_a_stop_records_when_and_at_what_price(store):
+    signal = make_signal()
+    store.insert_signal(signal)
+    update_open_signals(store, {"BTC/USDT": 94.0})
+
+    loaded = store.get_signal(signal.id)
+    stop = next(m for m in loaded.milestones if m.kind == "stop")
+    assert stop.price == pytest.approx(94.0)
+    assert stop.at is not None
+    assert stop.at.tzinfo is not None
+
+
+def test_target_one_and_the_final_exit_are_both_recorded(store):
+    signal = make_signal()
+    store.insert_signal(signal)
+    update_open_signals(store, {"BTC/USDT": 108.0})      # T1
+    update_open_signals(store, {"BTC/USDT": 113.0})      # T2
+
+    kinds = [m.kind for m in store.get_signal(signal.id).milestones]
+    assert kinds == ["target1", "target"]
+
+
+def test_milestones_run_forward_in_time(store):
+    signal = make_signal()
+    signal.milestones = (Milestone("fired", signal.created_at, 100.0),)
+    store.insert_signal(signal)
+    update_open_signals(store, {"BTC/USDT": 108.0})
+    update_open_signals(store, {"BTC/USDT": 113.0})
+
+    times = [m.at for m in store.get_signal(signal.id).milestones]
+    assert times == sorted(times)
+
+
+def test_the_card_publishes_the_timeline_and_the_hold(store):
+    signal = make_signal()
+    store.insert_signal(signal)
+    update_open_signals(store, {"BTC/USDT": 94.0})
+
+    card = store.get_signal(signal.id).to_public_dict()
+    assert card["minutes_held"] is not None
+    assert card["milestones"]
+    assert card["milestones"][-1]["kind"] == "stop"
+    assert card["milestones"][-1]["price"] == pytest.approx(94.0)
+
+
+def test_an_open_signal_has_no_hold_time_yet(store):
+    signal = make_signal()
+    store.insert_signal(signal)
+    assert store.get_signal(signal.id).to_public_dict()["minutes_held"] is None
+
+
+def test_a_row_written_before_milestones_existed_still_loads(store):
+    """An older database file must not break on the new column."""
+    signal = make_signal()
+    store.insert_signal(signal)
+    store._connection.execute("UPDATE signals SET milestones_json='' WHERE id=?", (signal.id,))
+    store._connection.commit()
+    assert store.get_signal(signal.id).milestones == ()

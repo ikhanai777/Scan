@@ -215,6 +215,24 @@ class Levels:
         return abs(target - self.entry_mid) / risk if risk > 0 else 0.0
 
 
+@dataclass(frozen=True)
+class Milestone:
+    """One timestamped price event in a signal's life."""
+
+    kind: str                 # fired | target1 | target | stop | expired
+    at: datetime
+    price: float
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "at": self.at.isoformat(),
+            "price": self.price,
+            "detail": self.detail,
+        }
+
+
 @dataclass
 class Signal:
     """A fired call, and the record we later grade it against."""
@@ -243,6 +261,16 @@ class Signal:
     peak_r: float = 0.0
     trough_r: float = 0.0
     target1_hit_at: datetime | None = None
+    # Every price event, in order: what happened, when, and at what price.
+    # `created_at` alone cannot answer "when did it hit the stop, and where was
+    # price then" -- and that is the first question anyone asks of a closed
+    # signal. Mirrors the backtest's fill timeline, so a live trade and a
+    # replayed one read the same way.
+    milestones: tuple[Milestone, ...] = ()
+    #: What the market looked like and what the timeframe above was doing.
+    #: "fired in a chop" is something a trader wants to see before sizing.
+    regime: str = ""
+    htf_note: str = ""
     notes: str = ""
 
     @property
@@ -295,7 +323,19 @@ class Signal:
             "realized_r": round(self.realized_r, 2) if self.realized_r is not None else None,
             "peak_r": round(self.peak_r, 2),
             "trough_r": round(self.trough_r, 2),
+            "target1_hit_at": self.target1_hit_at.isoformat() if self.target1_hit_at else None,
+            "minutes_held": round(self.minutes_held, 1) if self.minutes_held is not None else None,
+            "milestones": [m.to_dict() for m in self.milestones],
+            "regime": self.regime,
+            "htf_note": self.htf_note,
         }
+
+    @property
+    def minutes_held(self) -> float | None:
+        """Wall-clock life of the signal, once it has closed."""
+        if self.closed_at is None:
+            return None
+        return (self.closed_at - self.created_at).total_seconds() / 60.0
 
 
 @dataclass(frozen=True)

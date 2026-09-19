@@ -20,6 +20,7 @@ from datetime import datetime
 from .alerts import NotifierGroup
 from .config import Settings
 from .context import MarketContext
+from .correlation import PortfolioHeat
 from .exchange import Feed, FeedError, candles_are_stale
 from .execution import ExecutionEngine
 from .features import TechnicalFeatures, compute_features
@@ -29,11 +30,13 @@ from .levels import build_levels
 from .models import (
     Candidate,
     LegScore,
+    Milestone,
     ScanReport,
     Signal,
     expiry_for,
     utcnow,
 )
+from .regime import classify, higher_timeframe_for, higher_timeframe_trend
 from .screen import setup_score, shortlist, stage1_universe
 from .store import Store
 from .tracker import update_open_signals
@@ -59,6 +62,10 @@ class Scanner:
         # Kept from the last cycle so the coin detail view can show the chart
         # readings behind a score without refetching.
         self.last_features: dict[str, TechnicalFeatures] = {}
+        #: The regime reading per symbol from the last cycle, for the API.
+        self.last_regimes: dict[str, object] = {}
+        #: What is open and how much of it is really the same bet.
+        self.heat = PortfolioHeat()
 
     # -- one cycle --------------------------------------------------------
 
@@ -103,6 +110,7 @@ class Scanner:
         # 3. Stage 2 -- one indicator pass each, ranked by how live the setup is.
         candidates: list[Candidate] = []
         features_by_symbol: dict[str, TechnicalFeatures] = {}
+        regimes: dict[str, object] = {}
         fetch_failures = 0
         stale_charts = 0
         for market in universe:
@@ -119,9 +127,11 @@ class Scanner:
             if features is None:
                 continue
             features_by_symbol[market.symbol] = features
+            regimes[market.symbol] = classify(candles)
             candidates.append(setup_score(market, features, self.settings))
 
         self.last_features = features_by_symbol
+        self.last_regimes = regimes
         finalists = shortlist(candidates, self.settings)
 
         # 4. Kill-switch, checked before anything fires.
@@ -130,7 +140,7 @@ class Scanner:
         # 5. Deep analysis and fusion on the shortlist.
         fired = 0
         if not halted:
-            fired = self._analyse_and_fire(finalists, features_by_symbol)
+            fired = self._analyse_and_fire(finalists, features_by_symbol, regimes)
 
         finished_at = utcnow()
         attempts = getattr(stats, "attempts", len(universe) + 1) if stats else len(universe) + 1
@@ -153,12 +163,14 @@ class Scanner:
         return report
 
     def _analyse_and_fire(self, finalists: list[Candidate],
-                          features_by_symbol: dict[str, TechnicalFeatures]) -> int:
+                          features_by_symbol: dict[str, TechnicalFeatures],
+                          regimes: dict[str, object] | None = None) -> int:
         capacity = self.settings.max_open_signals - len(self.store.open_symbols())
         if capacity <= 0:
             log.info("at max open signals (%d), holding fire", self.settings.max_open_signals)
             return 0
 
+        self._sync_heat(features_by_symbol)
         pending: list[tuple[float, Candidate, TechnicalFeatures, object]] = []
         for candidate in finalists:
             features = features_by_symbol.get(candidate.symbol)
@@ -166,7 +178,9 @@ class Scanner:
                 continue
             legs: list[LegScore] = [score_technical(features, self.settings)]
             legs.extend(self._extra_legs(candidate, features))
-            fusion = fuse(legs, self.settings)
+            fusion = fuse(legs, self.settings,
+                          higher=self._higher_timeframe(candidate.symbol),
+                          regime=(regimes or {}).get(candidate.symbol))
             if fusion.fired:
                 pending.append((fusion.confidence, candidate, features, fusion))
 
@@ -174,7 +188,14 @@ class Scanner:
         pending.sort(key=lambda row: row[0], reverse=True)
 
         fired = 0
-        for _, candidate, features, fusion in pending[:capacity]:
+        for _, candidate, features, fusion in pending:
+            if fired >= capacity:
+                break
+            # Correlation is checked here rather than at ranking time, because
+            # it depends on what has already been accepted this cycle.
+            allowed = self._check_correlation(candidate, fusion)
+            if not allowed:
+                continue
             signal = self._build_signal(candidate, features, fusion)
             if signal is None:
                 continue
@@ -192,6 +213,60 @@ class Scanner:
                     log.exception("execution failed on %s", signal.symbol)
             fired += 1
         return fired
+
+    def _sync_heat(self, features_by_symbol: dict[str, TechnicalFeatures]) -> None:
+        """Rebuild the exposure book from what the store says is open."""
+        if not self.settings.enable_correlation_control:
+            return
+        self.heat = PortfolioHeat()
+        for signal in self.store.open_signals():
+            candles = self._candles_for(signal.symbol)
+            if candles is not None:
+                self.heat.add(signal.symbol, signal.direction,
+                              self.settings.risk_per_trade_pct / 100.0, candles)
+
+    def _candles_for(self, symbol: str):
+        try:
+            return self.feed.candles(symbol)
+        except Exception:
+            return None
+
+    def _check_correlation(self, candidate: Candidate, fusion) -> bool:
+        if not self.settings.enable_correlation_control:
+            return True
+        candles = self._candles_for(candidate.symbol)
+        if candles is None:
+            return True
+
+        risk = self.settings.risk_per_trade_pct / 100.0
+        decision = self.heat.check(
+            candidate.symbol, fusion.direction, risk, candles,
+            budget=self.settings.max_effective_exposure * risk,
+            max_correlation=self.settings.max_pair_correlation,
+            bars=self.settings.correlation_bars,
+        )
+        if not decision:
+            log.info("correlation held fire on %s: %s", candidate.symbol, decision.reason)
+            return False
+        self.heat.add(candidate.symbol, fusion.direction, risk, candles)
+        return True
+
+    def _higher_timeframe(self, symbol: str):
+        """The trend one timeframe up, cached hard because it moves slowly."""
+        if not self.settings.enable_htf_confluence:
+            return None
+        timeframe = higher_timeframe_for(self.settings.timeframe, self.settings)
+        try:
+            # A 4h candle changes four times a day; refetching it every cycle
+            # spends rate budget to learn nothing.
+            candles = self.feed.candles(symbol, timeframe=timeframe, cache_seconds=900.0)
+        except TypeError:
+            # A Feed that predates the timeframe argument simply has no higher
+            # timeframe to offer, which the filter treats as "undecided".
+            return None
+        if candles is None:
+            return None
+        return higher_timeframe_trend(candles)
 
     def _extra_legs(self, candidate: Candidate, features: TechnicalFeatures) -> list[LegScore]:
         """The fundamental and sentiment legs, when their providers are wired.
@@ -224,7 +299,7 @@ class Scanner:
             return None
 
         created_at = utcnow()
-        return Signal(
+        signal = Signal(
             id=uuid.uuid4().hex[:12],
             symbol=candidate.symbol,
             base=candidate.market.base,
@@ -240,7 +315,17 @@ class Scanner:
             setup_score=candidate.setup_score,
             created_at=created_at,
             expires_at=expiry_for(created_at, levels.hold_minutes),
+            regime=getattr(fusion, "regime", ""),
+            htf_note=getattr(fusion, "htf_note", ""),
         )
+        # The reference price and the moment it was read are the first entry in
+        # the timeline, so a closed card can always answer "where did this
+        # start, and when".
+        signal.milestones = (Milestone(
+            "fired", created_at, features.close,
+            f"{fusion.direction.value} @ {fusion.confidence:.0f}% confidence",
+        ),)
+        return signal
 
     def _should_halt(self, fetch_failures: int, stale_charts: int, attempted: int) -> tuple[bool, str]:
         """The spec's kill-switch: a degraded feed stops new signals.

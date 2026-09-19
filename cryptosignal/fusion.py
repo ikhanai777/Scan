@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from .config import Settings
 from .models import Direction, Driver, LegName, LegScore
+from .regime import HigherTimeframe, Regime, RegimeReading, apply_confluence
 
 # Two legs pointing opposite ways by at least this much is a real conflict, not
 # noise around zero.
@@ -33,13 +34,20 @@ class Fusion:
     leg_scores: dict[str, float]
     drivers: tuple[Driver, ...]
     reporting_legs: tuple[str, ...]
+    #: What the higher timeframe and the regime did to this call, for the card.
+    raw_composite: float = 0.0
+    htf_note: str = ""
+    regime: str = ""
+    suppressed_reason: str = ""
 
     @property
     def fired(self) -> bool:
         return self.direction is not None
 
 
-def fuse(legs: list[LegScore], settings: Settings) -> Fusion:
+def fuse(legs: list[LegScore], settings: Settings,
+         higher: HigherTimeframe | None = None,
+         regime: RegimeReading | None = None) -> Fusion:
     weights = {
         LegName.TECHNICAL: settings.weight_technical,
         LegName.FUNDAMENTAL: settings.weight_fundamental,
@@ -58,6 +66,22 @@ def fuse(legs: list[LegScore], settings: Settings) -> Fusion:
         )
 
     composite = sum(leg.score * weights[leg.leg] for leg in reporting) / total_weight
+    raw_composite = composite
+
+    # The two filters a desk applies before looking at a setup at all.
+    htf_note = suppressed = ""
+    if settings.enable_htf_confluence and higher is not None:
+        composite, htf_note = apply_confluence(composite, higher, settings)
+        if composite == 0.0 and htf_note:
+            suppressed = htf_note
+
+    regime_name = regime.regime.value if regime is not None else ""
+    if (settings.skip_choppy_regime and regime is not None
+            and regime.regime is Regime.CHOPPY):
+        # Chop is where an indicator system bleeds: every level is a fake and
+        # every break reverses. Sitting it out is usually free.
+        composite = 0.0
+        suppressed = f"skipped: {regime.detail}"
 
     direction: Direction | None = None
     if composite >= settings.long_threshold:
@@ -72,6 +96,10 @@ def fuse(legs: list[LegScore], settings: Settings) -> Fusion:
 
     return Fusion(
         composite=composite,
+        raw_composite=raw_composite,
+        htf_note=htf_note,
+        regime=regime_name,
+        suppressed_reason=suppressed,
         direction=direction,
         confidence=round(confidence, 1),
         reduced_confidence=reduced,

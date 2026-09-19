@@ -73,7 +73,8 @@ class Feed(Protocol):
     """What the scanner needs from a data source. Fakes in tests implement this."""
 
     def snapshots(self) -> list[MarketSnapshot]: ...
-    def candles(self, symbol: str) -> Candles | None: ...
+    def candles(self, symbol: str, timeframe: str | None = None,
+                cache_seconds: float | None = None) -> Candles | None: ...
     def prices(self, symbols: list[str]) -> dict[str, float]: ...
 
 
@@ -234,9 +235,17 @@ class CCXTFeed:
             change_24h_pct=_number(ticker.get("percentage")),
         )
 
-    def candles(self, symbol: str) -> Candles | None:
-        """OHLCV for one symbol. Returns None on a failure the caller should count."""
-        key = f"ohlcv:{symbol}"
+    def candles(self, symbol: str, timeframe: str | None = None,
+                cache_seconds: float | None = None) -> Candles | None:
+        """OHLCV for one symbol. Returns None on a failure the caller should count.
+
+        `timeframe` defaults to the configured trading timeframe. A higher
+        timeframe is passed explicitly with a longer cache: a 4-hour candle
+        changes four times a day, and refetching it every two minutes spends
+        rate budget to learn nothing.
+        """
+        timeframe = timeframe or self.settings.timeframe
+        key = f"ohlcv:{timeframe}:{symbol}"
         cached = self._cache.get(key)
         if cached is not None:
             return cached
@@ -245,7 +254,7 @@ class CCXTFeed:
         self._throttle()
         try:
             rows = self._client.fetch_ohlcv(
-                symbol, timeframe=self.settings.timeframe, limit=self.settings.ohlcv_limit
+                symbol, timeframe=timeframe, limit=self.settings.ohlcv_limit
             )
         except Exception as exc:
             self.stats.record(ok=False)
@@ -253,10 +262,10 @@ class CCXTFeed:
             return None
         self.stats.record(ok=True)
 
-        candles = Candles.from_rows(symbol, self.settings.timeframe, rows or [])
+        candles = Candles.from_rows(symbol, timeframe, rows or [])
         if len(candles) == 0:
             return None
-        self._cache.put(key, candles, self.settings.ohlcv_cache_seconds)
+        self._cache.put(key, candles, cache_seconds or self.settings.ohlcv_cache_seconds)
         return candles
 
     def history(self, symbol: str, bars: int, page_size: int = 1000) -> Candles | None:
