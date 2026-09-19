@@ -34,6 +34,11 @@ docker compose up --build        # http://localhost:8000
 open interest and the order book come from the exchange; TVL, the Fear & Greed
 index and the news feeds are public and keyless. Keys only buy extra sources.
 
+Handing the install to an agent instead? **[`AGENT_SETUP.md`](AGENT_SETUP.md)**
+is the same five steps written as a runbook: every step has a command, an
+observable result to check it against, and what to do when it fails — plus the
+two settings an agent must never touch on its own.
+
 ### Start with `doctor`
 
 "It runs" and "it is reading a live market" are different claims, and only the
@@ -420,11 +425,32 @@ which is one-way within a process: a human restarts to clear it.
 
 ## Dashboard and alerts
 
-`make serve` puts the dashboard on `:8000`: a live-scrolling feed of signal
-cards with per-leg scores and a countdown to each holding window, filters by
-status, direction and confidence, the watchlist with setup scores, the track
-record, live data-source health, and the execution panel with its limits. It
-updates over server-sent events.
+`make serve` puts the dashboard on `:8000`. It updates over server-sent events,
+and it is one file with no build step, no framework and no web fonts — it
+renders identically with the network unplugged.
+
+**Each card** carries the direction badge, symbol, regime, confidence, the entry
+band, stop and both targets, the per-leg chips, the drivers that moved the
+score, and the timestamped milestone line for every price event. Above them sits
+a sparkline **framed on the trade's own levels, not the coin's recent range** —
+scaling to the 96-bar high and low is the obvious thing and it is wrong, because
+a coin that ran 40% this week squeezes stop, entry and both targets into three
+pixels. Bars outside that window are clipped and the card says how many, so the
+frame is never a quiet crop.
+
+**The right rail** holds the published track record with its equity curve and
+outcome mix, the watchlist with setup scores, correlation-weighted portfolio
+risk, the execution panel and its limits, per-source health for the last cycle,
+and the cycle's own timings.
+
+Filters by status, direction, confidence and symbol persist across reloads.
+`j`/`k` move through cards, `Enter` expands one, `/` jumps to search, `Esc`
+clears the filters.
+
+Two rules the whole page obeys: a leg with no data reads `--` and is greyed,
+never drawn as a zero; and a hit rate never appears without its sample size
+beside it — `n=1` in the header, and "too few to conclude" under 30 closed
+trades.
 
 | Endpoint | |
 |---|---|
@@ -440,6 +466,7 @@ updates over server-sent events.
 | `GET /api/regimes` | what kind of market each scanned coin is in |
 | `GET /api/status` | last cycle plus the resolved tuning |
 | `GET /api/features/{symbol}` | the indicator readings behind a score |
+| `GET /api/history/{symbol}` | timestamped closes from the last cycle, for the sparkline |
 | `GET /api/stream` | server-sent events |
 
 Telegram ships first; a JSON webhook takes the same card as structured data. A
@@ -462,7 +489,7 @@ ones is the point; halting both would leave open positions ungraded.
 ## Testing, and what is real
 
 ```bash
-make dev && make test        # 409 tests, 14 skipped until you record fixtures
+make dev && make test        # 415 tests, 14 skipped until you record fixtures
 make lint
 ```
 

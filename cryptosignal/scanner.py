@@ -43,6 +43,9 @@ from .tracker import update_open_signals
 
 log = logging.getLogger(__name__)
 
+#: Bars of price kept per symbol for the dashboard's sparkline.
+SPARKLINE_BARS = 96
+
 
 class Scanner:
     def __init__(self, settings: Settings, feed: Feed, store: Store,
@@ -64,6 +67,9 @@ class Scanner:
         self.last_features: dict[str, TechnicalFeatures] = {}
         #: The regime reading per symbol from the last cycle, for the API.
         self.last_regimes: dict[str, object] = {}
+        #: A short price tail per symbol, so the dashboard can draw a sparkline
+        #: without asking the venue again for data the cycle already had.
+        self.last_closes: dict[str, list[list[float]]] = {}
         #: What is open and how much of it is really the same bet.
         self.heat = PortfolioHeat()
 
@@ -128,6 +134,10 @@ class Scanner:
                 continue
             features_by_symbol[market.symbol] = features
             regimes[market.symbol] = classify(candles)
+            tail = min(len(candles), SPARKLINE_BARS)
+            self.last_closes[market.symbol] = [
+                [candles.timestamps[-tail + i], candles.close[-tail + i]] for i in range(tail)
+            ]
             candidates.append(setup_score(market, features, self.settings))
 
         self.last_features = features_by_symbol

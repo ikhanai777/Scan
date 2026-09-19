@@ -267,6 +267,36 @@ class Store:
         ).fetchone()
         return json.loads(row["report_json"]) if row else None
 
+    def equity_curve(self) -> list[dict]:
+        """Cumulative R in the order trades actually closed.
+
+        The sequence matters as much as the total: the same set of trades in a
+        different order produces a different drawdown, and the curve is what
+        makes a run of losses visible where a single expectancy number hides it.
+        """
+        rows = self._connection.execute(
+            """
+            SELECT symbol, direction, realized_r, closed_at
+              FROM signals
+             WHERE realized_r IS NOT NULL AND closed_at IS NOT NULL
+             ORDER BY closed_at
+            """
+        ).fetchall()
+
+        curve, equity, peak = [], 0.0, 0.0
+        for row in rows:
+            equity += float(row["realized_r"])
+            peak = max(peak, equity)
+            curve.append({
+                "at": row["closed_at"],
+                "symbol": row["symbol"],
+                "direction": row["direction"],
+                "r": round(float(row["realized_r"]), 3),
+                "equity": round(equity, 3),
+                "drawdown": round(peak - equity, 3),
+            })
+        return curve
+
     # -- performance ------------------------------------------------------
 
     def performance(self) -> dict[str, object]:

@@ -103,7 +103,11 @@ def create_app(settings: Settings | None = None, store: Store | None = None,
 
     @app.get("/api/performance")
     def performance() -> dict:
-        return {"performance": store.performance(), "disclaimer": settings.DISCLAIMER}
+        return {
+            "performance": store.performance(),
+            "equity_curve": store.equity_curve(),
+            "disclaimer": settings.DISCLAIMER,
+        }
 
     @app.get("/api/status")
     def status() -> dict:
@@ -162,6 +166,17 @@ def create_app(settings: Settings | None = None, store: Store | None = None,
                        if context.regime else None),
             "legs": legs,
         }
+
+    @app.get("/api/history/{symbol:path}")
+    def history(symbol: str) -> dict:
+        """Recent closes for a symbol, for the card's sparkline."""
+        if scanner is None:
+            raise HTTPException(status_code=503, detail="no scanner attached to this process")
+        tail = getattr(scanner, "last_closes", {}) or {}
+        rows = tail.get(symbol) or tail.get(symbol.upper())
+        if not rows:
+            raise HTTPException(status_code=404, detail="symbol not in the last scan cycle")
+        return {"symbol": symbol, "closes": rows}
 
     @app.get("/api/risk")
     def risk() -> dict:

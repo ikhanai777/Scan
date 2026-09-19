@@ -126,6 +126,31 @@ def test_performance_counts_wins_losses_and_drawdown(store):
     assert performance["avg_hold_minutes"] == pytest.approx(30.0)
 
 
+def test_equity_curve_follows_the_order_trades_closed(store):
+    """Order is the whole point: the same trades rearranged draw a different curve."""
+    outcomes = [2.5, -1.0, -1.0, 1.5]
+    for i, realized in enumerate(outcomes):
+        signal = make_signal(f"C{i}/USDT", id=f"s{i}")
+        store.insert_signal(signal)
+        signal.status = SignalStatus.CLOSED_TARGET if realized > 0 else SignalStatus.CLOSED_STOP
+        signal.realized_r = realized
+        # Minutes apart, so closed_at sorts the way the list reads.
+        signal.closed_at = signal.created_at + timedelta(minutes=30 + i)
+        store.update_outcome(signal)
+
+    curve = store.equity_curve()
+    assert [point["symbol"] for point in curve] == [f"C{i}/USDT" for i in range(4)]
+    assert [point["equity"] for point in curve] == pytest.approx([2.5, 1.5, 0.5, 2.0])
+    # Drawdown is measured from the running peak of 2.5, never from zero.
+    assert [point["drawdown"] for point in curve] == pytest.approx([0.0, 1.0, 2.0, 0.5])
+    assert all(point["direction"] == "long" and point["at"] for point in curve)
+
+
+def test_equity_curve_is_empty_before_anything_closes(store):
+    store.insert_signal(make_signal(id="still-open"))
+    assert store.equity_curve() == []
+
+
 def test_performance_splits_by_direction(store):
     long_signal = make_signal("BTC/USDT", Direction.LONG, id="l")
     short_signal = make_signal("ETH/USDT", Direction.SHORT, id="s")

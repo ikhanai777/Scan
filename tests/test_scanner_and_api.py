@@ -393,6 +393,38 @@ def test_features_endpoint_serves_the_last_cycles_readings(client):
     assert body["features"]["atr"] > 0
 
 
+def test_history_endpoint_serves_timestamped_closes(client):
+    """The card's sparkline needs bars, and each one has to carry its own time."""
+    api, _ = client
+    body = api.get("/api/history/C0/USDT").json()
+    assert body["symbol"] == "C0/USDT"
+    assert len(body["closes"]) >= 3
+    stamps = [at for at, _ in body["closes"]]
+    assert stamps == sorted(stamps)
+    assert all(isinstance(close, float) for _, close in body["closes"])
+
+
+def test_history_endpoint_404s_for_an_unscanned_symbol(client):
+    api, _ = client
+    assert api.get("/api/history/NOPE/USDT").status_code == 404
+
+
+def test_history_endpoint_is_explicit_when_no_scanner_is_attached(settings, store):
+    """A dashboard talking to a bare API must not read the 503 as "no such coin"."""
+    from fastapi.testclient import TestClient
+
+    from cryptosignal.api.app import create_app
+
+    api = TestClient(create_app(settings, store, None))
+    assert api.get("/api/history/C0/USDT").status_code == 503
+
+
+def test_performance_endpoint_carries_the_equity_curve(client):
+    api, _ = client
+    body = api.get("/api/performance").json()
+    assert body["equity_curve"] == []  # nothing closed yet, and it says so
+
+
 def test_features_endpoint_404s_for_an_unscanned_symbol(client):
     api, _ = client
     assert api.get("/api/features/NOPE/USDT").status_code == 404
